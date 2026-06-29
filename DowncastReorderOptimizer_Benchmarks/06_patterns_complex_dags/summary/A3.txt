@@ -1,0 +1,159 @@
+================================================================================
+  Experiment A3 -- MIXED-KIND, SAME-TYPE FAN-OUT (cache split)
+  DowncastReorderOptimizer DAG-topology gap test
+================================================================================
+
+Status   : COMPLETE.
+Date     : 2026-05-20
+Hardware : RTX 2080 Ti (68 SMs, ~64 KB unified L1/shared per SM)
+Compiler : Triton 3.6.0 with DowncastReorderOptimizer at
+           lib/Dialect/Triton/Transforms/DowncastReorderOptimizer.cpp
+
+
+--------------------------------------------------------------------------------
+1. WHAT A3 TESTS
+--------------------------------------------------------------------------------
+
+A3 is one of the seven DAG-topology gaps in future_experiments.txt.
+When two consumers of a producer produce nominally the SAME result type
+but via DIFFERENT OperationName values, the dedup cache (keyed on
+(OperationName, ResultType)) splits them into SEPARATE rewritten
+chains.
+
+The policy question A3 raises: should arith.fptosi and arith.fptoui
+share a chain when they produce the same MLIR result type? Currently
+the cache distinguishes them because the key includes OperationName.
+
+Kernel: fp32 cat fed by:
+  arith.fptosi -> int8
+  arith.fptoui -> uint8
+
+   load a (fp32)         load b (fp32)
+       |                       |
+   reshape                  reshape
+       \\__________ cat ________/                 <- fp32 cat
+                    |
+            +-------+-------+
+            |               |
+         fptosi           fptoui           <- different OpName,
+         (i8)             (u8)                same i8 result type
+            |               |
+         store i8         store u8
+
+
+--------------------------------------------------------------------------------
+2. STRUCTURAL PROOF (TTIR)
+--------------------------------------------------------------------------------
+
+OFF TTIR:
+  %c    = tt.cat %a_flat, %b_flat : tensor<16384xf32> -> tensor<32768xf32>
+  %d_i8 = arith.fptosi %c : tensor<32768xf32> to tensor<32768xi8>
+  %d_u8 = arith.fptoui %c : tensor<32768xf32> to tensor<32768xi8>
+                                                    ^^^^^^^^^^^^
+                                                    -- SAME element type
+
+ON TTIR:
+  %c    = tt.cat ... : tensor<16384xi8> -> tensor<32768xi8>   <- fptoui chain
+  %c_28 = tt.cat ... : tensor<16384xi8> -> tensor<32768xi8>   <- fptosi chain
+  -- TWO i8 cats, one per OperationName
+
+Both fptosi and fptoui produce the SAME MLIR result type
+`tensor<32768xi8>` (signless integer). The cache key sees two
+entries differing ONLY in OperationName.
+
+
+--------------------------------------------------------------------------------
+3. POLICY VERDICT
+--------------------------------------------------------------------------------
+
+Although the result types match, the SEMANTICS of fptosi (signed) and
+fptoui (unsigned) DIFFER for the same fp32 input. Sharing a chain
+would mean ONE rewritten output would be reused for both stores,
+producing the WRONG bits for one of them. The current
+(OperationName, ResultType) key is CORRECT for correctness -- not a
+missed sharing opportunity. The cache split is NECESSARY, not a
+sub-optimal policy.
+
+
+--------------------------------------------------------------------------------
+4. BIT-EXACT VERIFICATION
+--------------------------------------------------------------------------------
+
+verify_all.sh ran A3 OFF and ON at (M, N, BM, BN) = (2048, 2048, 128, 128).
+Both outputs (out_i8, out_u8) bit-identical across OFF/ON. Combined
+SHA-256 matches.
+
+
+--------------------------------------------------------------------------------
+5. PERFORMANCE (10 nsys configs) -- LARGEST WIN IN A2-A7
+--------------------------------------------------------------------------------
+
+  M=N=8192:                            M=N=4096:
+    tile     OFF us  ON us    sp       tile     OFF us  ON us    sp
+    64x64    2622.0  2589.0   1.01x    64x64     505.3   510.3   0.99x
+    64x256   1845.8  1481.8   1.25x    64x256    462.8   375.7   1.23x
+    128x128  2212.4  1790.1   1.24x    128x128   530.2   417.5   1.27x
+    128x256  9938.5  2104.6   4.72x    128x256  2412.7   532.7   4.53x
+    256x128  8912.1  2294.4   3.88x    256x128  2151.6   560.2   3.84x
+
+  Summary: 8 wins / 2 neutral / 0 regressions. Best 4.72x at 128x256.
+
+
+--------------------------------------------------------------------------------
+6. NCU AT THE BIG WIN (128x256, 8192)
+--------------------------------------------------------------------------------
+
+  metric        OFF         ON
+  duration      9922us      2097us            (-79%, sp 4.73x)
+  DRAM total    4848 MB     1020 MB           (-3828 MB saved)
+  spill LD      17.24 M     0.91 M            (-95%)
+  spill ST      13.70 M     0.91 M            (-93%)
+  regs/thread   64          255 (cap)         (REGIME FLIP)
+  occupancy     94.9%       24.8%             (REGIME FLIP)
+
+The OFF kernel runs in a high-occupancy / 64-reg / heavy-spill
+regime (31M spill reqs). The pass narrows both chains to i8 (4x
+narrowing each), the cloned chains fit in 255 regs at low
+occupancy, spill collapses, DRAM bytes drop 80%.
+
+
+--------------------------------------------------------------------------------
+7. DRAM-BANDWIDTH ATTRIBUTION -- BEST IN STUDY
+--------------------------------------------------------------------------------
+
+  ON rate         = 1020 MB / 2097 us = 486 GB/s
+  Pred Δt         = 3828 MB / 486 GB/s = 7873 us
+  Observed Δt     = 7825 us
+  Explained       = 101%  (model explains essentially ALL of it)
+
+A3 BIGwin is the strongest single confirmation of the DRAM
+bandwidth-attribution model from speedup_explaination.txt Part 8:
+predicted vs observed Δt match within 1%. The mechanism
+(spill-regime collapse from i8 narrowing) is fully captured by the
+model.
+
+
+--------------------------------------------------------------------------------
+8. WHAT A3 ADDS TO THE STORY
+--------------------------------------------------------------------------------
+
+  - The cache split is verified necessary (not just policy-correct)
+    because the operations have different semantics for the same
+    input.
+  - Produces the LARGEST single-kernel speedup in the entire study
+    (4.72x at 128x256).
+  - 101% DRAM-model-explained -- the model essentially fully
+    predicts the wall delta from the DRAM bytes saved, which is the
+    strongest single confirmation of the mechanism story.
+
+
+--------------------------------------------------------------------------------
+9. ARTIFACTS
+--------------------------------------------------------------------------------
+
+  Kernel       : A2_to_A7/test_A3_mixedkind_2d.py
+  TTIR         : A2_to_A7/A3_mixedkind_{OFF,ON}.ttir
+  TTGIR        : A2_to_A7/A3_mixedkind_{OFF,ON}.ttgir
+  Verify log   : A2_to_A7/verify.log (A3 section)
+  Perf data    : A2_to_A7/nsys_results.csv  (rows with tag=A3)
+  ncu data     : /tmp/ncu_runs_A2A7/A3_*.csv

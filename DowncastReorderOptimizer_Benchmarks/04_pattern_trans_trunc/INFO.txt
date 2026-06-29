@@ -1,0 +1,4 @@
+Pattern : 04_pattern_trans_trunc
+Report  : Section 6.8 -- Pattern 4: Transpose -- Truncate
+Source  : triton_kernels/trans_trunc_(with_c)/
+Files   : 5

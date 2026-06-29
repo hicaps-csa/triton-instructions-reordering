@@ -1,0 +1,4 @@
+Pattern : 09_appendix_reshape_quant
+Report  : Section A.1 -- reshape + quant
+Source  : triton_kernels/reshape_quant_2d/
+Files   : 8

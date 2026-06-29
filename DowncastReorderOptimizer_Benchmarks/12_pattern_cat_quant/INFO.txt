@@ -1,0 +1,4 @@
+Pattern : 12_pattern_cat_quant
+Report  : Section A.5 -- Pattern 12: Concatenate -- Quantize
+Source  : triton_kernels/cat_quant_2d/
+Files   : 8

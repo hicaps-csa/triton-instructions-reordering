@@ -1,0 +1,113 @@
+================================================================================================
+  Triton 2-D asymmetric_diamond_trans_safe_2d_kernel -- nsys timing sweep
+  Pass under test: DowncastReorderOptimizer diamond gate (strict bail on non-reducer user)
+  Diamond head : tt.trans (fp32) -> { truncf -> fp16 store, direct fp32 store }
+                 (minimal diamond -- no arith on wide leg)
+  Expected     : OFF and ON identical (gate bails); see run_relaxed_sweep.sh
+                 for the relaxed-gate variant that quantifies the avoided regression.
+================================================================================================
+
+Setup
+------------------------------------------------------------------------------------------------
+  GPU         : RTX 2080 Ti (68 SMs)
+  Stack       : Triton 3.6.0 / nsys 2023.2.3 / torch 2.9.1+cu128
+  Iterations  : 100 between cudaProfilerStart/Stop, +3 warmup
+  Reported    : per-launch avg from `nsys cuda_gpu_kern_sum`
+  Block sizes : (BLOCK_M, BLOCK_N) in {64, 128, 256}^2 -- 9 distinct
+                kernels per matrix size.
+  Bytes/launch: 4*M*N (read fp32) + 2*M*N (write fp16) + 4*M*N (write fp32)
+              = 10*M*N
+
+=== Matrix size: 4096 x 4096  (16,777,216 elements/matrix) ===
+
+  Pass OFF -- avg per-launch time (us)
+           n=   64 n=  128 n=  256
+   m=  64   337.2   337.2   353.8
+   m= 128   328.1   321.9   458.1
+   m= 256   325.1   475.2  1573.8
+
+  Pass ON  -- avg per-launch time (us)
+           n=   64 n=  128 n=  256
+   m=  64   337.1   336.9   353.3
+   m= 128   328.1   321.8   458.1
+   m= 256   325.1   475.3  1571.9
+
+  Speedup (OFF/ON)  -- >1.00x means pass is faster
+           n=   64 n=  128 n=  256
+   m=  64   1.00x   1.00x   1.00x
+   m= 128   1.00x   1.00x   1.00x
+   m= 256   1.00x   1.00x   1.00x
+
+  Pass ON  -- effective bandwidth (GB/s, 18*M*N bytes/launch)
+           n=   64 n=  128 n=  256
+   m=  64   497.7   498.0   474.9
+   m= 128   511.3   521.4   366.3
+   m= 256   516.1   353.0   106.7
+
+  Detailed per-tile table
+       (m,n) |    tile |        grid |    OFF us |     ON us |  speedup | BW ON GB/s
+  ------------------------------------------------------------------------------------------
+       64x64 |    4096 |  64x64=4096 |    337.19 |    337.07 |    1.00x |      497.7
+      64x128 |    8192 |  64x32=2048 |    337.21 |    336.91 |    1.00x |      498.0
+      64x256 |   16384 |  64x16=1024 |    353.78 |    353.28 |    1.00x |      474.9
+      128x64 |    8192 |  32x64=2048 |    328.07 |    328.11 |    1.00x |      511.3
+     128x128 |   16384 |  32x32=1024 |    321.91 |    321.79 |    1.00x |      521.4
+     128x256 |   32768 |   32x16=512 |    458.13 |    458.06 |    1.00x |      366.3
+      256x64 |   16384 |  16x64=1024 |    325.10 |    325.10 |    1.00x |      516.1
+     256x128 |   32768 |   16x32=512 |    475.20 |    475.32 |    1.00x |      353.0
+     256x256 |   65536 |   16x16=256 |   1573.78 |   1571.88 |    1.00x |      106.7
+
+=== Matrix size: 8192 x 8192  (67,108,864 elements/matrix) ===
+
+  Pass OFF -- avg per-launch time (us)
+           n=   64 n=  128 n=  256
+   m=  64  1439.0  1493.0  1546.9
+   m= 128  1349.6  1362.9  1882.6
+   m= 256  1335.1  1984.1  6369.8
+
+  Pass ON  -- avg per-launch time (us)
+           n=   64 n=  128 n=  256
+   m=  64  1439.6  1488.9  1545.9
+   m= 128  1348.9  1363.3  1881.6
+   m= 256  1335.2  1981.6  6379.4
+
+  Speedup (OFF/ON)  -- >1.00x means pass is faster
+           n=   64 n=  128 n=  256
+   m=  64   1.00x   1.00x   1.00x
+   m= 128   1.00x   1.00x   1.00x
+   m= 256   1.00x   1.00x   1.00x
+
+  Pass ON  -- effective bandwidth (GB/s, 18*M*N bytes/launch)
+           n=   64 n=  128 n=  256
+   m=  64   466.2   450.7   434.1
+   m= 128   497.5   492.3   356.7
+   m= 256   502.6   338.7   105.2
+
+  Detailed per-tile table
+       (m,n) |    tile |        grid |    OFF us |     ON us |  speedup | BW ON GB/s
+  ------------------------------------------------------------------------------------------
+       64x64 |    4096 | 128x128=16384 |   1438.97 |   1439.57 |    1.00x |      466.2
+      64x128 |    8192 | 128x64=8192 |   1492.97 |   1488.94 |    1.00x |      450.7
+      64x256 |   16384 | 128x32=4096 |   1546.91 |   1545.92 |    1.00x |      434.1
+      128x64 |    8192 | 64x128=8192 |   1349.63 |   1348.85 |    1.00x |      497.5
+     128x128 |   16384 |  64x64=4096 |   1362.85 |   1363.25 |    1.00x |      492.3
+     128x256 |   32768 |  64x32=2048 |   1882.62 |   1881.55 |    1.00x |      356.7
+      256x64 |   16384 | 32x128=4096 |   1335.13 |   1335.17 |    1.00x |      502.6
+     256x128 |   32768 |  32x64=2048 |   1984.10 |   1981.62 |    1.00x |      338.7
+     256x256 |   65536 |  32x32=1024 |   6369.83 |   6379.39 |    1.00x |      105.2
+
+Findings
+------------------------------------------------------------------------------------------------
+  - Best speedup     : M=N=8192  (64, 128)  -> 1.00x  (1493.0us -> 1488.9us)
+  - Worst (regression): M=N=8192  (256, 256)  -> 1.00x  (6369.8us -> 6379.4us)
+
+  - Wins (>=1.10x)        : 0 configs
+  - Neutral (0.95-1.10x)  : 18 configs
+  - Regressions (<=0.95x) : 0 configs
+
+  At M=N=8192, recommended ncu configs:
+    win    : ( 64, 128)  speedup 1.00x
+    regr   : (256, 256)  speedup 1.00x
+    neutral: (256,  64)  speedup 1.00x
+
+================================================================================================

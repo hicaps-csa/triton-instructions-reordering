@@ -1,0 +1,279 @@
+================================================================================
+  Context file: Triton DowncastReorderOptimizer review + DAG-handling extensions
+  Use this to seed a follow-up Claude Code session.
+================================================================================
+
+ENVIRONMENT
+-------------------------------------------------------------------------------
+  Working dir : /home/pushpendram (linux, bash)
+  GPU         : NVIDIA RTX 2080 Ti, 68 SMs, driver 535.104.12
+  Stack       : Triton 3.6.0, torch 2.9.1+cu128, nsys 2023.2.3,
+                ncu 2023.2.2.0, python 3.14.0 (venv: tritonenv)
+  Triton repo : /home/pushpendram/compiler/triton  (in-tree build, editable)
+  Python venv : /home/pushpendram/tritonenv/bin/python
+  Build dir   : /home/pushpendram/compiler/triton/build/cmake.linux-x86_64-cpython-3.14
+  Rebuild cmd : `ninja` from the build dir (incremental; rebuilds the .so
+                that backs `passes.ttir.add_downcast_reorder_optimizer`).
+  Kernel work : /home/pushpendram/triton_kernels
+
+
+PERMISSIONS / TOOLING NOTES
+-------------------------------------------------------------------------------
+  ncu requires GPU perf-counter access. Sudoers drop-in:
+      /etc/sudoers.d/ncu-claude
+      pushpendram ALL=(root) NOPASSWD: /opt/nvidia/nsight-compute/2023.2.2/ncu
+  CRITICAL: SETENV is NOT allowed. Therefore:
+    - sudo -E does NOT work (env-passing rejected)
+    - LC_ALL / TRITON_CACHE_DIR cannot reach ncu through sudo
+    - Workaround: use the default Triton cache (~/.triton/cache) and rm it
+      between pass-state toggles. Locale is en_IN, so ncu CSV uses Indian
+      number formatting ("1,23,456" = 123456). Aggregators strip commas
+      before float() conversion.
+
+  ncu metric gotchas:
+    - gpu__time_duration.sum is in MILLISECONDS, not nanoseconds
+    - "raw" page exports all metrics (~600 cols) as one row per kernel
+    - launch__registers_per_thread is the value ptxas chose (not max);
+      drifts from the user-set max when ptxas estimates spill cost
+
+
+WHAT DowncastReorderOptimizer DOES
+-------------------------------------------------------------------------------
+  Optimization: push size-reducing element-wise ops (truncf, trunci,
+  fptosi, fptoui, narrowing fp_to_fp, narrowing index_cast) BEFORE
+  data-movement ops.
+
+  Pattern (before):
+      %big   = tt.cat %a, %b : tensor<Nxf32> -> tensor<2Nxf32>
+      %small = arith.fptosi %big : tensor<2Nxf32> to tensor<2Nxi8>
+
+  Pattern (after):
+      %a_i8  = arith.fptosi %a : tensor<Nxf32> to tensor<Nxi8>
+      %b_i8  = arith.fptosi %b : tensor<Nxf32> to tensor<Nxi8>
+      %small = tt.cat %a_i8, %b_i8 : tensor<Nxi8> -> tensor<2Nxi8>
+
+
+SAFE DATA-MOVEMENT OPS HANDLED
+-------------------------------------------------------------------------------
+  triton::CatOp, triton::TransOp, triton::BroadcastOp,
+  triton::ReshapeOp, triton::ExpandDimsOp, triton::JoinOp,
+  triton::SplatOp (scalar source operand handled specially in clone path)
+
+
+12 ORIGINAL FIXES TO DowncastReorderOptimizer.cpp (earlier session)
+-------------------------------------------------------------------------------
+  1.  IndexCastOp validation: dyn_cast<IntegerType>; bails on `index`.
+  2+3. Fixed-point iteration loop replaces unsound stale-pointer guard.
+  4.  Removed dead null-check on builder.create(); added verify(...) with
+      erase + bail on malformed rewrites.
+  5.  Cross-block isBeforeInBlock guarded with same-block check.
+  6.  All cast<RankedTensorType> -> dyn_cast with early returns.
+  7.  Multi-consumer dedup keyed on std::pair<OperationName, Type>.
+  8.  Insertion-point dance simplified to single setInsertionPoint().
+  9.  Relaxed "all users must be size-reducing" (foundation for diamond).
+  10. llvm::outs/errs -> LLVM_DEBUG behind DEBUG_TYPE = "downcast-reorder-optimizer".
+  11. Added getDependentDialects: registers arith + triton.
+  12. Module-level verify(module) at end of runOnOperation.
+
+
+DAG-HANDLING EXTENSIONS (most recent session)
+-------------------------------------------------------------------------------
+  Three capabilities added to handle non-trivial DAG patterns:
+
+  (A) Diamond / partial-fanout support
+      eligibleReducers() now FILTERS to size-reducing users instead of
+      bailing when a non-reducer user exists. The original mover stays
+      alive for non-reducer consumers (use_empty()-guarded erase in
+      applyMultiConsumerOptimization). Cost: the mover may be duplicated
+      (one rewritten i8 path + the original fp32 path).
+
+  (B) In-pass chain propagation via worklist
+      runOnce now uses llvm::SmallSetVector seeded by an initial walk,
+      with upstream re-queueing after every rewrite. After rewriting a
+      producer, every defining op of its operands that's itself a safe
+      mover is added back to the worklist. Net effect: chains like
+      Cat -> Trans -> Truncate or Reshape -> Cat -> Truncate collapse
+      in a single runOnce instead of needing one outer iteration per
+      chain layer.
+
+  (C) Multi-reducer-kind fanout
+      Already handled by applyMultiConsumerOptimization's
+      DenseMap<pair<OperationName, Type>, Value> cache. A producer
+      feeding e.g. one truncf-to-fp16 and one fptosi-to-i8 gets one
+      rewritten chain per (kind, type) pair, with reducers of the same
+      (kind, type) sharing.
+
+  Outer fixed-point loop kept (capped 16 sweeps) as belt-and-braces.
+
+
+VERIFICATION (semantics-preserving)
+-------------------------------------------------------------------------------
+  1-D kernel (test_cat_quant.py): deterministic seed + sha256 checksum
+    OFF .ttir : tt.cat fp32x131072 -> arith.fptosi -> i8x131072
+    ON  .ttir : arith.fptosi fp32x65536 (x2) -> tt.cat i8 -> i8x131072
+    Checksum  : c70c5f3406bf12a247fc77aeaeb1b5d1bf5b11ebacbb4d96e0d11237c96642ee
+                identical OFF and ON -> pass-preserving.
+
+  2-D kernel (test_cat_quant_2d.py): post-DAG-extension IR shows
+  fptosi sinking ALL the way upstream past both the cat AND the
+  reshape in a single sweep:
+    OFF: reshape fp32 -> fp32, cat fp32, fptosi -> i8, reshape i8
+    ON : fptosi fp32 -> i8, reshape i8, cat i8, reshape i8
+
+  Diamond test (/tmp/test_diamond.py): synthetic kernel where cat feeds
+  both a fptosi (reducer) AND a mulf (non-reducer). Confirmed:
+    - i8 cat created for the reducer path
+    - original fp32 cat kept alive for the multiply
+  Both paths coexist in the rewritten IR.
+
+
+RECENT TIMING DATA (cat_quant_2d, M=N=8192, BLOCK_M=128, BLOCK_N=256)
+-------------------------------------------------------------------------------
+  Pre-DAG-extension nsys (cat_quant_2d sweep, 9 (m,n) x 2 sizes x 2 pass
+  states = 36 captures): peak speedup 7.09x at (128, 256) on 8192^2.
+  No regressions across 18 ON/OFF pairs.
+
+  Quick post-DAG-extension re-time (single config) : 7.12x (within noise).
+  See cat_quant_2d/nsys_results_2d.txt and ncu_results_2d.txt for the
+  full pre-DAG numbers including ncu mechanism breakdown.
+
+
+CAT_TRUNC_2D NCU NOW HAS 4 CONFIGS  (M = N = 8192, fp32 -> fp16)
+-------------------------------------------------------------------------------
+  Added the (128, 128) tile -- "mid" between neutral and win. The new
+  results expose a sub-cliff regime that the original 3-config sweep
+  missed: a measurable spill at (128, 128) that the pass kills entirely.
+
+      Config    Pass    Dur us   Reg    Occ %   DRAM %    Spill LD    Spill ST
+      neutral   OFF    1515.39    80    73.1    80.9          0           0
+      neutral   ON     1516.48    66    86.0    81.1          0           0
+      mid       OFF    1886.34   255    24.1    77.1     933.9K      933.9K   <-- new
+      mid       ON     1477.34   218    24.8    83.7          0           0   <-- new
+      win       OFF    9381.28    64    94.1    73.7      14.5M       14.8M
+      win       ON     2436.61   255    24.3    78.0       2.0M        2.0M
+      big       OFF    9925.86    64    88.6    70.4      14.6M       15.0M
+      big       ON     8710.08    64    89.9    68.8      12.3M       12.4M
+
+  Speedups (pass OFF / pass ON):
+      neutral 1.00x   mid 1.28x   win 3.85x   big 1.14x
+
+  MID story is interesting: even pass-OFF picks 255 regs/T (max), so
+  it can't trade occupancy for fewer spills -- it just spills ~1.87M
+  times anyway. With pass ON, the fp16 working set fits and spills
+  drop to zero. Speedup is modest (1.28x) because the spill volume at
+  this tile is small enough that DRAM time still dominates (DRAM goes
+  77% -> 84%, not as dramatic as the win case's 73% -> 78%).
+
+
+CURRENT FILES OF INTEREST
+-------------------------------------------------------------------------------
+  /home/pushpendram/compiler/triton/lib/Dialect/Triton/Transforms/DowncastReorderOptimizer.cpp
+      The pass under review. All 12 fixes + DAG extensions applied.
+
+  /home/pushpendram/compiler/triton/python/triton/backends/nvidia/compiler.py
+      Reads TRITON_DISABLE_DOWNCAST_REORDER_OPTIMIZER to toggle the pass. Currently: ON (env var unset).
+
+  /home/pushpendram/triton_kernels/cat_quant_2d/
+      Reference 2-D experiment with full pipeline:
+        test_cat_quant_2d.py    -- kernel
+        run_nsys_sweep_2d.sh    -- nsys sweep (9 (m,n) x 2 sizes x 2 pass)
+        run_ncu_sweep_2d.sh     -- ncu profiling, 3 configs x 2 pass
+        aggregate_results_2d.py -- 3x3 m-by-n speedup tables
+        aggregate_ncu_2d.py     -- ncu summary
+        nsys_results_2d.csv/.txt
+        ncu_results_2d.txt
+
+  /home/pushpendram/triton_kernels/{operation}_2d/
+      Per-operation experiment dirs the user maintains:
+        cat_trunc_2d, broadcast_trunc_2d, expand_dims_quant_2d,
+        join_quant_2d, reshape_quant_2d, splat_trunc_2d, trans_trunc_2d
+      I haven't inspected these; structure / state likely mirrors
+      cat_quant_2d. Worth checking before any new experiment.
+
+  /home/pushpendram/triton_kernels/reports/
+      Existing user-maintained reports:
+        Cat Quant.txt, Trans Trunc.txt
+        DowncastReorderOptimizer_CrossOperator_Report.{tex,pdf}
+        NCU_ANALYSIS_SUMMARY.md
+
+  /home/pushpendram/triton_kernels/{cat,trans} {trunc,quant}_(with_c)/
+      Earlier collaborative experiments (results CSVs and aggregators).
+
+  /tmp/test_diamond.py  -- synthetic diamond test for the DAG extension
+  /tmp/triton_2d_after_dag/, /tmp/triton_2d_off_dag/  -- recent .ttir dumps
+
+
+PROPOSED COMPLEX-DAG TEST KERNELS (not yet implemented)
+-------------------------------------------------------------------------------
+  Five kernels suggested to exercise the new DAG capabilities. Each is a
+  small variant of the cat_quant_2d harness and can reuse its sweep/ncu
+  scripts with minor tweaks. Status: only described, not yet written.
+
+  1. Deep chain  --  Reshape -> Cat -> Reshape -> Trans -> Trunc
+     Tests : in-pass chain propagation for a 4-deep mover chain. After
+             one runOnce the trunc should land on the original loads.
+     Watch : whether outer fixed-point iteration still hits 1 sweep.
+
+  2. Diamond residual  --  cat result feeds both fptosi AND mulf
+     Tests : diamond / partial-fanout (this is the case the strict pass
+             would have skipped entirely).
+     Expect: i8 cat for the quant path PLUS original fp32 cat kept alive
+             for the multiply. Both paths coexist post-pass.
+     Diag  : prime candidate for measuring whether duplication is worth
+             it -- if ON loses to OFF here, that motivates a cost heuristic.
+
+  3. Dual-precision quantize  --  cat result feeds (fptosi i8) AND (truncf f16)
+     Tests : multi-reducer-kind dedup cache (OperationName, Type) keyed.
+     Expect: TWO rewritten chains -- one fptosi-clones+i8 cat, one truncf-
+             clones+f16 cat. Original fp32 cat dies.
+
+  4. Diamond + chain combined  --  cat with reducer AND non-reducer users,
+     where the reducer side has upstream reshapes
+     Tests : worklist's upstream re-queue works correctly when the head
+             of a chain is also the head of a diamond.
+
+  5. Splat-quantize  --  scalar -> tt.splat -> trunc to i8
+     Tests : scalar-operand path in createTransformedDataMovement (uses
+             isIntOrIndexOrFloat() branch when operand is non-tensor).
+     Expect: trunc operates on the *scalar* before the splat; splat then
+             materializes i8 directly.
+
+  Implementation pattern: copy cat_quant_2d harness into
+  /home/pushpendram/triton_kernels/<name>_2d/, swap kernel body, reuse
+  run_nsys_sweep_2d.sh and run_ncu_sweep_2d.sh with minor edits.
+
+
+SUGGESTED NEXT STEPS
+-------------------------------------------------------------------------------
+  - Re-run the cat_quant_2d nsys + ncu sweeps post-DAG-extension to
+    check whether chain propagation moved any numbers materially.
+    Likely-not (the optimization is the same, just achieved in fewer
+    iterations) but worth confirming.
+
+  - Implement the five kernels above (or a subset). Diamond residual
+    (#2) and the dual-precision quantize (#3) are the highest-value ones
+    because they exercise paths the strict pre-DAG-extension version
+    would not have hit at all.
+
+  - Audit each {operation}_2d/ dir to see which experiments have been
+    run, which still need timing/ncu data, and whether any patterns
+    are NOT yet exercising the DAG extensions (e.g., diamonds where
+    the original strict pass would have skipped).
+
+  - The 256x256 BIG case in cat_quant_2d still leaves ~9M spill ops on
+    the table even with the pass on. Kernel-level workarounds (split
+    cat across multiple stores, pipeline load->trunc->store) would be
+    needed to drive that to zero. Not a pass change.
+
+  - Consider adding a cost heuristic for diamond rewrites (e.g., skip
+    when reducer fraction < some threshold so we don't duplicate large
+    movers for marginal benefit). Not yet observed to be a problem;
+    kernel #2 above is the one most likely to surface a regression.
+
+  - Cross-block rewriting: still rejected (the same-block requirement
+    keeps dominance + isBeforeInBlock simple). Could be revisited if
+    workloads with cross-block patterns become important.
+
+================================================================================
+
+Use Triton_Always_compile=1

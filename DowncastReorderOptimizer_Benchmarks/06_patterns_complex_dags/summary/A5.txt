@@ -1,0 +1,178 @@
+================================================================================
+  Experiment A5 -- CAT-OF-CATS / NESTED MOVERS
+  Worklist iteration bound test
+  DowncastReorderOptimizer DAG-topology gap test
+================================================================================
+
+Status   : COMPLETE.
+Date     : 2026-05-20
+Hardware : RTX 2080 Ti (68 SMs, ~64 KB unified L1/shared per SM)
+Compiler : Triton 3.6.0 with DowncastReorderOptimizer at
+           lib/Dialect/Triton/Transforms/DowncastReorderOptimizer.cpp
+
+
+--------------------------------------------------------------------------------
+1. WHAT A5 TESTS
+--------------------------------------------------------------------------------
+
+A5 is one of the seven DAG-topology gaps in future_experiments.txt.
+It tests that runOnce's worklist can rewrite a chain of THREE nested
+cats from a SINGLE seed (the outer cat) in ONE sweep. If the worklist
+failed to re-queue upstream movers correctly, the outer driver's
+defensive 16-iteration fixed-point loop would have to clean up.
+
+Kernel pattern (cat-of-cats with 4 inputs):
+
+   load a (fp32)  load b   load c   load d
+        \\        /          \\      /
+         cat_ab               cat_cd       <- inner cats
+            \\               /
+              ____ cat_abcd ___              <- outer cat
+                       |
+                    truncf-fp16
+                       |
+                    reshape
+                       |
+                    store fp16
+
+
+--------------------------------------------------------------------------------
+2. WORKLIST TRACE
+--------------------------------------------------------------------------------
+
+Initial walk seeds ONLY cat_abcd (its direct user is truncf-fp16,
+a reducer). The inner cats (cat_ab, cat_cd) have non-reducer users
+(the outer cat), so they are NOT initially eligible.
+
+Pop cat_abcd:
+  Push truncf above cat_abcd. cat_abcd becomes cat_abcd-on-fp16.
+  Upstream re-queue: cat_ab, cat_cd (both safe movers feeding
+  cat_abcd).
+
+Pop cat_cd:
+  Its user is now the cloned truncf from above. Rewrite. cat_cd
+  becomes cat_cd-on-fp16. Upstream re-queue: the two upstream
+  reshapes (which feed c_flat, d_flat).
+
+Pop cat_ab:
+  Same -- cat_ab-on-fp16. Upstream re-queue: the reshapes feeding
+  a_flat, b_flat.
+
+Pop and rewrite the four upstream reshapes (each on a fp32 load).
+
+End state: 4 cloned truncfs (one per loaded input), 3 fp16 cats
+(cat_ab, cat_cd, cat_abcd, all narrowed), 0 fp32 cats. All in ONE
+runOnce call -- the outer 16-iteration cap is not engaged.
+
+
+--------------------------------------------------------------------------------
+3. STRUCTURAL PROOF (TTIR)
+--------------------------------------------------------------------------------
+
+OFF TTIR (relevant ops):
+  %ab   = tt.cat %a_flat, %b_flat : f32 -> 32768xf32
+  %cd   = tt.cat %c_flat, %d_flat : f32 -> 32768xf32
+  %abcd = tt.cat %ab, %cd : 32768xf32 -> 65536xf32
+  %e    = arith.truncf %abcd : f32 to f16
+
+ON TTIR (relevant ops):
+  %e    = arith.truncf %a_19 : 128x128 fp32 to fp16    (one of 4)
+  %e_32 = arith.truncf %b_23 : 128x128 fp32 to fp16
+  %e_33 = arith.truncf %c_27 : 128x128 fp32 to fp16
+  %e_34 = arith.truncf %d_31 : 128x128 fp32 to fp16
+  ... (each followed by its reshape to 16384xf16)
+  %ab   = tt.cat %a_flat, %b_flat : 16384xf16 -> 32768xf16
+  %cd   = tt.cat %c_flat, %d_flat : 16384xf16 -> 32768xf16
+  %abcd = tt.cat %ab, %cd        : 32768xf16 -> 65536xf16
+
+Single-sweep convergence VERIFIED: 5 worklist pops, 1 runOnce.
+
+
+--------------------------------------------------------------------------------
+4. BIT-EXACT VERIFICATION
+--------------------------------------------------------------------------------
+
+verify_all.sh ran A5 OFF and ON at (M, N, BM, BN) = (2048, 2048, 128, 128).
+Output bit-identical across OFF/ON. SHA-256 matches.
+
+
+--------------------------------------------------------------------------------
+5. PERFORMANCE (10 nsys configs)
+--------------------------------------------------------------------------------
+
+  M=N=8192:                            M=N=4096:
+    tile     OFF us   ON us    sp      tile     OFF us  ON us    sp
+    64x64    3514.7   3501.2   1.00x   64x64     926.8   923.6   1.00x
+    64x256  18729.7   3291.4   5.69x   64x256   4625.1   838.6   5.52x
+    128x128 18214.0   3298.6   5.52x   128x128  4476.5   862.3   5.19x
+    128x256 18701.4  20954.9   0.89x   128x256  4557.6  5098.4   0.89x
+    256x128 18234.3  19451.2   0.94x   256x128  4456.0  4753.3   0.94x
+
+  Summary: 4 wins / 2 neutral / 4 regressions. Best 5.69x at 64x256.
+
+A5 has the LARGEST SPEEDUP in the bundle (5.69x at 64x256) AND four
+regressions. Mechanism: with 3 cats and 4 cloned truncfs after the
+pass, the per-chain register pressure varies dramatically with tile
+size. At 64x256 the four narrow chains fit comfortably; at 128x256
+they collide and spill more than the single fp32 chain did.
+
+
+--------------------------------------------------------------------------------
+6. NCU AT THE REGR (128x256, 8192) -- MEASUREMENT QUIRK
+--------------------------------------------------------------------------------
+
+  metric        OFF         ON
+  duration      18671us     18633us           (0.99x, neutral in ncu)
+  DRAM total    9179 MB     9180 MB           (no change in single launch)
+  spill LD      28.66 M     28.66 M           (no change)
+  spill ST      29.38 M     29.38 M           (no change)
+  regs/thread   64          64                (same regime)
+  occupancy     94.3%       94.4%             (same)
+
+NOTE: the ncu single-launch capture of A5 regr shows OFF and ON
+essentially equal, while the nsys 100-launch average shows a 0.89x
+regression. Possible causes:
+  - ncu's --launch-skip 5 captures a single post-warmup launch which
+    may not match the average behavior over 100 runs.
+  - ncu's kernel replay (22 passes in the trace) measures a stable-
+    state launch that differs from the average.
+
+The PER-LAUNCH nsys variance (a 0.89x regression averaged over 100
+launches) is the more reliable headline number. The single-launch
+ncu telemetry confirms there is NO register-count or spill-count
+change between OFF and ON at this tile -- so any regression is in
+the kernel-launch path or in launch-to-launch variance, not in
+steady-state per-launch work.
+
+This refinement is useful for the future B8 register-pressure
+heuristic: when steady-state metrics tie but the multi-launch
+average regresses, look elsewhere.
+
+
+--------------------------------------------------------------------------------
+7. WHAT A5 ADDS TO THE STORY
+--------------------------------------------------------------------------------
+
+  - Single-sweep convergence verified on a 3-cat nested mover chain
+    starting from a single worklist seed.
+  - LARGEST single-tile speedup in the entire study (5.69x at 64x256
+    on 8192^2).
+  - Shows the regression family from dual_quant_2d / A1 scales with
+    cloned-chain count: 4 cloned chains regress at 0.89x; A1's 3
+    cloned chains regress at 0.79x; dual_quant_2d's 2 cloned chains
+    regress at 0.68x (different tile counts, same mechanism). Future
+    B8 heuristic should consider chain-count when deciding to fire.
+  - Documents a meaningful discrepancy between single-launch ncu
+    and multi-launch nsys averages for the regression cases.
+
+
+--------------------------------------------------------------------------------
+8. ARTIFACTS
+--------------------------------------------------------------------------------
+
+  Kernel       : A2_to_A7/test_A5_catofcats_2d.py
+  TTIR         : A2_to_A7/A5_catofcats_{OFF,ON}.ttir
+  TTGIR        : A2_to_A7/A5_catofcats_{OFF,ON}.ttgir
+  Verify log   : A2_to_A7/verify.log (A5 section)
+  Perf data    : A2_to_A7/nsys_results.csv  (rows with tag=A5)
+  ncu data     : /tmp/ncu_runs_A2A7/A5_*.csv

@@ -1,0 +1,254 @@
+================================================================================
+  Context file: Triton DowncastReorderOptimizer evaluation on trans -> truncf pattern
+  (trans_trunc_fused kernel). Use this to seed a follow-up Claude Code
+  session. Companion / continuation of ../SESSION_CONTEXT.txt (cat_quant).
+================================================================================
+
+ENVIRONMENT
+-------------------------------------------------------------------------------
+  Working dir : /home/pushpendram/triton_kernels/trans trunc (with c)
+  GPU         : NVIDIA RTX 2080 Ti, 68 SMs, CC 7.5, driver 535.104.12
+  Stack       : Triton 3.6.0 (in-tree), torch 2.9.1+cu128, nsys 2023.2.3,
+                ncu 2023.2.2
+  Triton repo : /home/pushpendram/compiler/triton  (editable build)
+  Pass toggle : TRITON_DISABLE_DOWNCAST_REORDER_OPTIMIZER env var
+                (unset = ON, =1 = OFF; left unset at end of session)
+  Python      : /home/pushpendram/tritonenv/bin/python -> pyenv 3.14.0
+
+
+WHAT THE PRIOR SESSION ESTABLISHED (recap; see ../SESSION_CONTEXT.txt)
+-------------------------------------------------------------------------------
+  DowncastReorderOptimizer pulls size-reducing element-wise ops (truncf, fptosi,
+  fptoui, narrowing index_cast) BEFORE data-movement ops (cat, trans,
+  broadcast). It was validated on cat_quant_spill_baseline (fp32 cat ->
+  int8 truncate) where it produced a 2.7x speedup at the spill cliff
+  (m*n=32768) by keeping a truncated working set in registers. At larger
+  blocks both versions spilled and the pass was neutral or slightly
+  negative.
+
+  Twelve fixes were applied to DowncastReorderOptimizer.cpp (validation, fixed-point
+  iteration, multi-consumer dedup, error handling, debug logging,
+  module-level verify, etc.). The pass is correct and semantics-
+  preserving on cat -> truncate.
+
+  Open question heading into this session: does DowncastReorderOptimizer also help on
+  the trans -> truncate pattern that the user opened transtruncnew.py to
+  explore?
+
+
+FILES TOUCHED IN THIS SESSION
+-------------------------------------------------------------------------------
+  /home/pushpendram/triton_kernels/trans trunc (with c)/trans_trunc_fused.py
+      Single fused kernel that LOAD fp32 -> tl.trans -> .to(fp16) -> STORE.
+      CLI: --m, --n, --block-m, --block-n, --iterations, --seed,
+           --mode {correctness, nsys}.
+      correctness mode: deterministic seed, sha256(dst), compare against
+                        torch reference src.T.contiguous().to(float16).
+      nsys mode       : 3 warmup iters + N profiled iters inside
+                        cudaProfilerStart/Stop.
+
+  /home/pushpendram/triton_kernels/trans trunc (with c)/run_trans_trunc_sweep.sh
+      Bash sweeper for the 16-config nsys timing experiment:
+        BLOCK_M x BLOCK_N in {64,128,256,512}^2, M=N=5793, ITERS=100.
+      Toggles DowncastReorderOptimizer via the
+      TRITON_DISABLE_DOWNCAST_REORDER_OPTIMIZER env var, uses separate
+      TRITON_CACHE_DIR per pass state, and parses nsys cuda_gpu_kern_sum
+      into the CSV.
+
+  /home/pushpendram/triton_kernels/trans trunc (with c)/run_ncu_compare.sh
+      Bash sweeper for ncu --set full at 3 representative block sizes
+      (64x64, 128x128, 256x256), pass OFF and ON. Uses passwordless
+      sudo for ncu (see SUDOERS SETUP below). target-processes is
+      application-only (NOT all -- that killed gcc subprocesses).
+
+  /home/pushpendram/triton_kernels/trans trunc (with c)/trans_trunc_results.csv
+      Raw nsys timings: 32 rows = 16 blocks x 2 pass states.
+
+  /home/pushpendram/triton_kernels/trans trunc (with c)/trans_trunc_summary.txt
+      Final human-readable report: methodology, IR-stage hashes,
+      timing matrices, ncu metric tables, spill counters, conclusions.
+
+  /home/pushpendram/compiler/triton/python/triton/backends/nvidia/compiler.py
+      make_ttir reads TRITON_DISABLE_DOWNCAST_REORDER_OPTIMIZER to toggle the pass; currently unset (ON).
+
+  /etc/sudoers.d/ncu-profiling   (created during session)
+      pushpendram ALL=(root) NOPASSWD: SETENV: /opt/nvidia/nsight-compute/2023.2.2/ncu
+      Allows passwordless sudo for the ncu binary (and only that),
+      with -E to preserve env. Required because GPU perf counters
+      need root on this system (NVGPUCTRPERM otherwise).
+
+  /tmp/triton_tt_cache_off, /tmp/triton_tt_cache_on
+      Per-pass-state Triton compilation caches.
+      NOTE: now contain root-owned files from the sudo'd ncu run.
+      The ncu sweep script's `rm -rf` of these dirs will fail under
+      a non-root user; harmless because TRITON_CACHE_DIR reuses by
+      hash and same-source compiles produce same hashes.
+
+  /tmp/ncu_trans_trunc/*.ncu-rep   (root-owned)
+      6 ncu reports: {OFF, ON} x {bm64_bn64, bm128_bn128, bm256_bn256}.
+
+  /tmp/nsys_trans_trunc/           one .nsys-rep + .log per sweep cell.
+
+
+WHAT THIS SESSION DID, IN ORDER
+-------------------------------------------------------------------------------
+  1. Reviewed transtruncnew.py (user-opened). Found:
+     - Two manual two-kernel pipelines (Trans(f32)->Trunc(f16) baseline vs
+       Trunc(f16)->Trans(f16) optimized) with explicit ordering. Bit-exact
+       output verified against torch reference.
+     - Three issues for SESSION_CONTEXT-style reuse:
+         * Doesn't actually exercise DowncastReorderOptimizer: trans and trunc are in
+           SEPARATE kernels, so the pass never sees both ops in the same IR.
+         * Bug at lines 178-192: benchmark_optimized has a duplicate
+           non-timing inner loop before the real timing loop -> asymmetric
+           warmup vs baseline.
+         * ref_output computed but unused; correctness check only compares
+           baseline vs optimized with tol 0.01 (should be 0.0).
+     - Decided to write a single FUSED kernel for the proper test.
+
+  2. Wrote trans_trunc_fused.py (fused kernel + correctness/nsys driver).
+
+  3. Correctness test, OFF and ON:
+     - For 7 shape/block configs from (1024,1024)/(32,32) up to
+       (8192,8192)/(128,128), including non-square (3072x5120, 1024x4096):
+       OFF SHA256(dst) == ON SHA256(dst) == SHA256(torch.ref).
+     - IR diff (4096x4096, BLOCK 64x64) confirmed the pass FIRES:
+         OFF: tt.trans (f32->f32) then arith.truncf (f32->f16)
+         ON : arith.truncf (f32->f16) then tt.trans (f16->f16)
+     - Result: pass is semantics-preserving on trans -> truncf.
+
+  4. nsys timing sweep (run_trans_trunc_sweep.sh):
+     - 16 BLOCK_M x BLOCK_N configs in {64,128,256,512}^2, M=N=5793
+       (so M*N ~= 2^25), 100 profiled iters per config, OFF and ON.
+     - Headline: every cell falls in 0.992x-1.002x speedup -- pure noise.
+     - Block shape itself causes 10x range (best 64x128 ~386us, worst
+       256x64 ~4072us); pass change has no measurable effect.
+
+  5. PTX-equivalence hypothesis test:
+     - Hashed every artifact stage between OFF and ON for all 16 block
+       configs:
+         .ttir   DIFF       (pass acts here)
+         .ttgir  DIFF       (rewrite still visible after TTGIR conv)
+         .llir   MATCH      (TTGIR -> LLVM IR conversion erases it)
+         .ptx    MATCH
+         .cubin  MATCH
+     - Conclusion: rewrite is bit-equivalent at the LLVM-IR boundary.
+
+  6. ncu --set full at 3 representative blocks (64x64, 128x128, 256x256),
+     OFF and ON:
+     - All counters EQUAL within run-to-run noise: registers/thread,
+       duration, DRAM/Compute/L1/L2 throughput, occupancy.
+     - Spill counters (smsp__sass_inst_executed_op_local_ld/st.sum) are
+       IDENTICAL TO THE INSTRUCTION between OFF and ON:
+         64x64    : 0 / 0           (no spills, 88 regs/thread)
+         128x128  : 245,456 each    (255 regs, register-saturated)
+         256x256  : 687,700 ld /
+                    675,004 st      (deep spill region)
+     - Three independent confirmations the pass is a no-op at SASS:
+       PTX hash, cubin hash, ncu spill counters.
+
+  7. Wrote trans_trunc_summary.txt with the full set of tables and the
+     interpretation.
+
+
+WHY THE PASS DOES NOTHING HERE (vs cat_quant winning)
+-------------------------------------------------------------------------------
+  tl.trans on a register-resident tile is a logical layout permutation,
+  not a memory data movement. Bit-width at the trans step doesn't change
+  register-allocation decisions or live-range structure: the same number
+  of bytes are permuted in place. By the time the IR-level pass would
+  have shrunk anything, ptxas has already chosen the same allocation
+  either way -- so the LLVM-IR conversion produces identical sequences.
+
+  tl.cat is structurally different: it DOUBLES tile size at a specific
+  point in the IR. Pulling truncate before tl.cat keeps the doubled
+  tile in 8-bit form (fits in registers) instead of 32-bit (spills).
+  That is a register-pressure shift the back end cannot undo, which
+  is why cat_quant got a 2.7x win at the spill cliff.
+
+  tl.trans does not have that property. Do not extend the pass to try
+  to "cover" trans without first finding a pattern where the rewrite
+  changes the lowering -- this kernel proved it does not.
+
+
+SUDOERS SETUP (to allow passwordless ncu)
+-------------------------------------------------------------------------------
+  Created in this session via:
+    sudo bash -c 'cat > /etc/sudoers.d/ncu-profiling <<EOF
+    pushpendram ALL=(root) NOPASSWD: SETENV: /opt/nvidia/nsight-compute/2023.2.2/ncu
+    EOF
+    chmod 440 /etc/sudoers.d/ncu-profiling
+    visudo -cf /etc/sudoers.d/ncu-profiling'
+
+  Sanity check: sudo -n /opt/nvidia/nsight-compute/2023.2.2/ncu --version
+  should print ncu version with no prompt.
+
+  ncu invocations in run_ncu_compare.sh use:
+      sudo -n -E "$NCU" --set full --launch-skip 3 --launch-count 1 \
+           --target-processes application-only --force-overwrite ...
+  -E preserves env; -n fails fast if sudo unexpectedly needs a password;
+  application-only is REQUIRED -- target-processes=all causes ncu to
+  kill triton's gcc subprocess and the run fails with rc=1 + cuda driver
+  init error.
+
+
+CURRENT STATE
+-------------------------------------------------------------------------------
+  - Pass ON (TRITON_DISABLE_DOWNCAST_REORDER_OPTIMIZER unset at end of all sweeps).
+  - Caches at /tmp/triton_tt_cache_{off,on} contain root-owned files
+    from the sudo'd ncu run; harmless but the next sweep's `rm -rf`
+    will report Permission denied on those files (script proceeds).
+    To fully clear: `sudo rm -rf /tmp/triton_tt_cache_{off,on}`.
+  - 6 ncu reports in /tmp/ncu_trans_trunc/ (root-owned, world-readable).
+  - Final summary: trans_trunc_summary.txt (this directory).
+  - Companion: ../SESSION_CONTEXT.txt for the cat_quant session.
+
+
+WHAT'S OPEN / SUGGESTED NEXT STEPS
+-------------------------------------------------------------------------------
+  - Extend DowncastReorderOptimizer coverage to a pattern where data-movement
+    INFLATES the live set:
+      * tl.broadcast (small -> large) followed by truncate
+      * tl.expand_dims followed by truncate
+      * Combined cat -> trans -> truncate chain (would already be
+        partially handled if cat dominates the live-range growth).
+    For each candidate, repeat this session's recipe:
+      1. Single fused kernel exercising the chain.
+      2. Correctness test OFF/ON, sha256 matches torch reference.
+      3. IR-stage hash comparison (.ttir vs .ttgir vs .llir vs .ptx vs
+         .cubin) -- if .llir already MATCHES, the pass cannot win.
+      4. nsys 2D sweep over BLOCK_M x BLOCK_N.
+      5. ncu --set full at 3 representative blocks; check spill counters.
+
+  - Tile-shape perf: within OFF (or ON) for trans_trunc_fused, the
+    range is ~10x. A separate optimization avenue independent of
+    DowncastReorderOptimizer.
+
+  - The 0.85-0.97x regression at large blocks observed in cat_quant
+    (../SESSION_CONTEXT.txt) is still open: profile with cuda_gpu_kern_sum
+    + ptxas register report, decide whether to gate the pass on a
+    tile-size heuristic.
+
+
+REPRODUCTION QUICK-REF
+-------------------------------------------------------------------------------
+  Correctness (single config):
+    TRITON_CACHE_DIR=/tmp/triton_tt_on \
+    python "trans_trunc_fused.py" --m 4096 --n 4096 --block-m 64 \
+                                  --block-n 64 --mode correctness
+
+  Full nsys sweep (16 blocks x OFF/ON):
+    bash run_trans_trunc_sweep.sh
+
+  Full ncu sweep (3 blocks x OFF/ON, requires the sudoers entry):
+    bash run_ncu_compare.sh
+
+  Inspect a specific report:
+    ncu --import /tmp/ncu_trans_trunc/ON_bm128_bn128.ncu-rep \
+        --csv --print-units base | less
+
+  Diff TTIR between OFF and ON (one config):
+    diff <(cat /tmp/triton_tt_cache_off/*/trans_trunc_fused_kernel.ttir) \
+         <(cat /tmp/triton_tt_cache_on/*/trans_trunc_fused_kernel.ttir)
+
+================================================================================

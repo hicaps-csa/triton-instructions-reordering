@@ -1,0 +1,199 @@
+================================================================================
+  Fill-in sweep: 4 missing tiles on A2-A5 (Patterns 6-9 in the report)
+  Filling the heatmap (Figure 11) cells that the original A2-A7 sweep
+  did not cover.
+================================================================================
+
+Date         : 2026-06-09
+Hardware     : RTX 2080 Ti (sm_75)
+Stack        : Triton 3.6.0 + DowncastReorderOptimizer (DowncastReorderOptimizer) with
+               the register-pressure gate active
+Pass toggle  : env var TRITON_DISABLE_DOWNCAST_REORDER_OPTIMIZER  (=1 -> OFF; unset -> ON)
+Iterations   : 100 per nsys capture, + 3 warmup
+Script       : run_missing_tiles_sweep.sh
+Results CSV  : missing_tiles_results.csv
+nsys-rep dir : /tmp/nsys_missing_tiles/
+
+--------------------------------------------------------------------------------
+1. WHAT THE ORIGINAL SWEEP MISSED
+--------------------------------------------------------------------------------
+
+run_nsys_sweep_all.sh covers only 5 of the 9 tiles in the {64,128,256}^2 grid:
+    measured : (64,64) (64,256) (128,128) (128,256) (256,128)
+    not measured : (64,128) (128,64) (256,64) (256,256)
+
+The Final_Report heatmap (Figure 11) shows these 4 tiles as grey "---" cells
+for Patterns 6-9 (A2 cache hit, A3 cache split, A4 multi-level, A5 cat-of-
+cats). This fill-in sweep closes those gaps so the heatmap is complete and
+the best-vs-best / viable-tile counts can be computed against the full 9-tile
+grid for these patterns as well.
+
+Kernels included:  A2, A3, A4, A5  (Patterns 6, 7, 8, 9)
+Kernels skipped :  A6 (already 1.00x at every tile by design), A7 (same)
+
+Captures        : 4 kernels x 4 tiles x 2 sizes x 2 states = 64
+Runtime         : ~25 minutes wallclock
+
+--------------------------------------------------------------------------------
+2. RAW DATA (per-launch averaged over 100 iterations, M=N=8192)
+--------------------------------------------------------------------------------
+
+  Kernel  Tile        OFF (us)   ON (us)    Speedup
+  ----------------------------------------------------
+  A2     ( 64,128)    2225.1    2226.6     1.00x
+  A2     (128, 64)    2855.6    2901.2     0.98x
+  A2     (256, 64)    3560.6    2858.2     1.25x   *
+  A2     (256,256)   10971.0   10979.3     1.00x
+
+  A3     ( 64,128)    1832.9    1819.9     1.01x
+  A3     (128, 64)    2757.5    2500.6     1.10x   *
+  A3     (256, 64)    2992.5    2486.2     1.20x   *
+  A3     (256,256)   11159.6   11164.4     1.00x
+
+  A4     ( 64,128)    2222.6    2240.2     0.99x
+  A4     (128, 64)    2898.4    2869.3     1.01x
+  A4     (256, 64)    3565.9    2878.3     1.24x   *
+  A4     (256,256)   10974.1   10961.7     1.00x
+
+  A5     ( 64,128)    3864.8    3002.2     1.29x   *
+  A5     (128, 64)    4367.3    3491.7     1.25x   *
+  A5     (256, 64)   19685.4    3839.3     5.13x   ** SPILL-CLIFF RESCUE
+  A5     (256,256)   18847.6   18846.8     1.00x
+
+  * = measurable win (>=1.10x)
+  ** = rescue >=3x
+
+Raw data for M=N=4096 is also in missing_tiles_results.csv; the report's
+heatmap fixes M=N=8192 so the table above lists 8192 only.
+
+--------------------------------------------------------------------------------
+3. WHAT THE NEW DATA SHOWS
+--------------------------------------------------------------------------------
+
+(a) "Wide-but-short" tiles (m=256, n=64) are a third small-n spill class.
+    Across A2/A4 the (256,64) tile produces a 1.24x-1.25x same-tile speedup;
+    A3 (which narrows to i8 -- 4x not 2x) gives 1.20x at the same tile. The
+    mechanism mirrors the (128,128) / (64,256) cache-hit wins already in the
+    report. The narrowed cat shrinks the post-cat tile and ptxas can keep
+    more working set in registers; previously we missed this entire column
+    of the heatmap.
+
+(b) A5 has a second large rescue at (256,64): 5.13x. The known A5 rescue
+    is 5.69x at (64,256). The (256,64) cell sits one column over and shows
+    the same pattern: at 256 elements per inner dim with 4 cloned narrow
+    chains, the OFF kernel exceeds 255 regs and spills heavily (19.7 ms
+    per launch); the narrowed ON chain stays in registers (3.8 ms). The
+    rescue is real and reproducible in two non-square tile shapes for A5.
+
+(c) The largest tiles (256,256) are uniformly NO-OP across A2/A3/A4/A5.
+    At (256,256) every kernel spills heavily in BOTH OFF and ON; the
+    register-pressure gate is engaged for the rewrite candidates that
+    would still spill post-narrowing. This matches the gate's design.
+
+(d) (64,128) and (128,64) at A2/A4 are essentially neutral (0.98x-1.01x).
+    These are tile shapes where neither state spills and the SASS is
+    similar. Expected.
+
+--------------------------------------------------------------------------------
+4. IMPACT ON DOWNSTREAM REPORT NUMBERS
+--------------------------------------------------------------------------------
+
+With all 9 tiles measured for Patterns 6-9, the best-OFF and best-ON tiles
+shift in some cases. Recomputed B-v-B and viable counts (out of 9 now):
+
+  Pattern  B-v-B (old) -> (new)   Viable OFF->ON (old /5) -> (new /9)
+  --------------------------------------------------------------------
+  6 (A2)     1.15x  ->  1.09x         2->2  /5    ->   3->3  /9
+  7 (A3)     1.25x  ->  1.24x         2->3  /5    ->   2->4  /9
+  8 (A4)     1.16x  ->  1.09x         2->2  /5    ->   3->3  /9
+  9 (A5)     1.07x  ->  1.17x         1->3  /5    ->   2->6  /9
+
+Why the shifts:
+  P6 / P8 : new (64,128) OFF is faster than the old best (64,256), so
+            the OFF-best tile moves and the B-v-B narrows.
+  P7      : same effect (new (64,128) slightly faster) -- tiny shift.
+  P9      : new (64,128) ON is faster than the old (64,256) best; the
+            ON-best tile moves and the B-v-B widens. Pattern 9's
+            workload-level gain is now meaningful (1.17x) rather than
+            marginal (1.07x).
+
+Diamond-family range becomes 1.06x-1.24x (was 1.06x-1.25x). Pattern 7 is
+still the largest workload speedup in the diamond family. Pattern 9's
+shift means it joins the meaningfully-positive group rather than reading
+as essentially-neutral.
+
+Locations in Final_Report.tex that quote these numbers and will need
+updating for consistency:
+  - Abstract: diamond range 1.06-1.25 -> 1.06-1.24
+  - Table 9 ("Performance Summary"): B-v-B and Viable columns for P6-P9
+  - Bar chart Figure 12 (bvb_time_per_pattern): OFF bar values + speedup
+    labels for P6-P9
+  - Heatmap caption: drop "Patterns 6-9 swept on 5 tiles only"
+  - Discussion "Reading the table" paragraph (mentions P3 at 1.21x,
+    P7 at 4.72x peak rescue) -- still correct
+  - Discussion "Multi-consumer diamonds are the exception" paragraph
+    -- numbers for P6/P8 need updating; P9 needs reclassification
+
+--------------------------------------------------------------------------------
+5. NOTES ON METHODOLOGY
+--------------------------------------------------------------------------------
+
+(a) The pass-toggle was via env var, not the sed approach. This is the
+    fix mentioned in A2_bvb_investigation.txt: the old sed targeted
+    compiler.py line 243, which moved to a wrapper with 12-space indent
+    after the register-pressure gate was wired in. Using
+    TRITON_DISABLE_DOWNCAST_REORDER_OPTIMIZER guarantees the toggle takes effect.
+
+(b) Per-tile timing comes from nsys cuda_gpu_kern_sum (the same protocol
+    as the original sweep), 100 iterations between cudaProfilerStart and
+    cudaProfilerStop, 3 warmup launches discarded. avg_ns column of the
+    CSV is what the speedup table uses.
+
+(c) The register-pressure gate is ACTIVE in this run. For the heaviest
+    tiles where the gate refuses (e.g., A2 (256,256), A4 (256,256), and
+    A5 (256,256)), the OFF and ON IR are identical and the per-launch
+    times match within noise. This is exactly the gate's intended
+    behavior and now appears as a row of 1.00x cells in the heatmap.
+
+(d) Bit-exact correctness was NOT re-verified for the new tiles in this
+    sweep (the original A1-A7 verification covered the 5 sampled tiles).
+    If the heatmap data is to be a citable claim, a SHA-256 pass over
+    every output at every new tile should be added. The mechanism the
+    pass uses is identical to the existing 5 tiles; no new code paths
+    are exercised.
+
+--------------------------------------------------------------------------------
+6. ARTIFACTS PRODUCED
+--------------------------------------------------------------------------------
+
+  /home/pushpendram/triton_kernels/A2_to_A7/
+    run_missing_tiles_sweep.sh        -- the fill-in sweep script
+    missing_tiles_results.csv         -- raw nsys output, 64 rows
+    missing_tiles_sweep_writeup.txt   -- this file
+
+  /tmp/nsys_missing_tiles/
+    *.nsys-rep                        -- 64 per-capture profiling reports
+    *.log                             -- per-capture stdout/stderr
+
+--------------------------------------------------------------------------------
+7. ONE-PARAGRAPH SUMMARY
+--------------------------------------------------------------------------------
+
+The fill-in sweep closes the 16 missing cells in Final_Report Figure 11
+(Patterns 6-9 at the 4 tiles the original sweep skipped). Most missing
+cells are neutral (1.00x), but four reveal real wins: a (256,64) cluster
+across A2/A3/A4 in the 1.20x-1.25x range, an A5 (256,64) cell at 5.13x
+that is a second spill-cliff rescue alongside the known 5.69x at (64,256),
+and modest (64,128) and (128,64) wins on A5 (1.29x and 1.25x). The (256,
+256) cells are uniformly neutral because the register-pressure gate
+correctly refuses the rewrite there. The new data shifts a few derived
+numbers in the report (Pattern 9's B-v-B moves from 1.07x to 1.17x;
+Patterns 6/8 move from 1.15-1.16x down to 1.09x as their OFF-best tile
+moves to (64,128)); the heatmap caption no longer needs the "5 tiles only"
+disclaimer; and the diamond-family B-v-B range becomes 1.06x-1.24x. The
+gate's behavior under heavy spill is empirically confirmed: every (256,
+256) cell is 1.00x.
+
+================================================================================
+END
+================================================================================

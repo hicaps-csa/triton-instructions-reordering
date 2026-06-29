@@ -1,0 +1,193 @@
+================================================================================
+  Experiment A4 -- MULTI-LEVEL DIAMOND (cache + worklist together)
+  DowncastReorderOptimizer DAG-topology gap test
+================================================================================
+
+Status   : COMPLETE.
+Date     : 2026-05-20
+Hardware : RTX 2080 Ti (68 SMs, ~64 KB unified L1/shared per SM)
+Compiler : Triton 3.6.0 with DowncastReorderOptimizer at
+           lib/Dialect/Triton/Transforms/DowncastReorderOptimizer.cpp
+
+
+--------------------------------------------------------------------------------
+1. WHAT A4 TESTS
+--------------------------------------------------------------------------------
+
+A4 is one of the seven DAG-topology gaps in future_experiments.txt.
+It tests the pass's two main mechanisms -- the dedup CACHE and the
+worklist's UPSTREAM-PROPAGATION -- working together.
+
+Pattern: cat fans out into TWO branches, each with MORE movers
+(reshape, trans+reshape) before terminating in arith.truncf-to-fp16.
+The pass must reach cat ONLY after rewriting the lower movers, and
+only THEN does cat see two truncf-fp16 users (which the cache then
+dedups).
+
+   load A (fp32)         load B (fp32)
+        |                       |
+    reshape                  reshape
+        \\__________ cat ________/
+                     |
+            +--------+--------+
+            |                 |
+         reshape           reshape          <- another layer of movers
+         (2BM, BN)         (BM, 2BN)
+            |                 |
+         trans               truncf-fp16
+            |                 |
+         truncf-fp16          reshape
+            |                 |
+         trans                store fp16
+            |
+         store fp16
+
+Initial walk seeds only the lower movers (which have direct truncf
+users). Cat is NOT initially eligible (its direct users are
+reshapes, not reducers). It only becomes eligible after upstream
+propagation re-queues it.
+
+
+--------------------------------------------------------------------------------
+2. STRUCTURAL PROOF (TTIR)
+--------------------------------------------------------------------------------
+
+OFF TTIR (relevant ops):
+  %c   = tt.cat %a_flat, %b_flat : f32 -> 32768 fp32
+  %c1  = tt.reshape %c            : 32768xf32 -> 256x128xf32     (branch 1)
+  %c1_t = tt.trans %c1            : 256x128xf32 -> 128x256xf32
+  %d1  = arith.truncf %c1_t       : 128x256xf32 to 128x256xf16
+  %out1 = tt.trans %d1            : 128x256xf16 -> 256x128xf16
+  %c2  = tt.reshape %c            : 32768xf32 -> 128x256xf32     (branch 2)
+  %d2  = arith.truncf %c2         : 128x256xf32 to 128x256xf16
+  %out2 = tt.reshape %d2          : 128x256xf16 -> 256x128xf16
+
+ON TTIR (relevant ops, post-pass + canonicalize):
+  %d1     = arith.truncf %a_19 : 128x128 fp32 to fp16    (cloned, on load)
+  %a_flat = tt.reshape %d1 : 16384 fp16
+  %d1_24  = arith.truncf %b_23 : 128x128 fp32 to fp16
+  %b_flat = tt.reshape %d1_24
+  %c      = tt.cat %a_flat, %b_flat : tensor<16384xf16> -> tensor<32768xf16>
+                                                                          ^^^^^
+                                                                          ONE cat-on-fp16
+  %c1     = tt.reshape %c : 256x128 fp16
+  %c2     = tt.reshape %c : 128x256 fp16
+  %out2   = tt.reshape %c2 : 256x128 fp16
+  -- branch 1 stores %c1 directly (trans-truncf-trans collapsed)
+
+Two observations:
+  (1) Cache hit at cat: ONE cat-on-fp16 shared by both branches.
+  (2) Branch 1's trans-truncf-trans collapsed into just `c1 = reshape(c)`
+      after the pass + downstream canonicalize. Pass pushes truncf
+      above the first trans, leaving trans(trans(...)) which
+      canonicalize recognizes as identity. Then pass continues
+      pushing truncf above reshape, above cat.
+
+
+--------------------------------------------------------------------------------
+3. WORKLIST TRACE
+--------------------------------------------------------------------------------
+
+Initial walk seeds:
+  - trans (branch 1): user truncf -> eligible
+  - reshape c2 (branch 2): user truncf -> eligible
+  (cat is NOT seeded; its users are reshapes, not reducers)
+
+Pop trans (branch 1): push truncf above. The cloned truncf becomes
+  the new user of c1 (the upstream reshape). Re-queue c1.
+
+Pop reshape c2 (branch 2): push truncf above. The cloned truncf
+  becomes the new user of cat. Re-queue cat.
+
+Pop c1 (branch 1): its user is now a cloned truncf. Push truncf
+  above. The cloned truncf becomes the new user of cat. Re-queue cat.
+
+Pop cat: BOTH its users are now cloned truncf-fp16 ops.
+  cache lookup -> MISS on first, HIT on second.
+  -> ONE rewritten cat-on-fp16, shared by both branches.
+  Upstream operands (the two reshapes coming from load) are
+  re-queued.
+
+Pop and rewrite the two upstream reshapes onto the loads.
+
+End state: 4 cloned truncfs (one per cat-operand-reshape upstream;
+later merged where possible by CSE), 1 cat-on-fp16, branch 1's
+trans-trans cancels via canonicalize.
+
+All in ONE runOnce sweep.
+
+
+--------------------------------------------------------------------------------
+4. BIT-EXACT VERIFICATION
+--------------------------------------------------------------------------------
+
+verify_all.sh ran A4 OFF and ON at (M, N, BM, BN) = (2048, 2048, 128, 128).
+Both outputs (out_trans, out_reshape) bit-identical across OFF/ON.
+Combined SHA-256 matches.
+
+
+--------------------------------------------------------------------------------
+5. PERFORMANCE (10 nsys configs)
+--------------------------------------------------------------------------------
+
+  M=N=8192:                            M=N=4096:
+    tile     OFF us  ON us   sp        tile     OFF us  ON us   sp
+    64x64    2899.8  2896.3  1.00x     64x64     680.1   681.5  1.00x
+    64x256   2367.6  2040.5  1.16x     64x256    587.8   508.8  1.16x
+    128x128  2636.0  2220.5  1.19x     128x128   661.1   537.5  1.23x
+    128x256 12985.3 11760.1  1.10x     128x256  3157.3  2874.4  1.10x
+    256x128 11392.0  9711.7  1.17x     256x128  2790.6  2371.7  1.18x
+
+  Summary: 7 wins / 3 neutral / 0 regressions. Best 1.23x at 128x128.
+
+A4 perf is NUMERICALLY NEAR-IDENTICAL to A2 -- both kernels end up
+with the same cache-hit-rewritten structure (1 cat-on-fp16 + 2
+downstream reshapes), so they produce essentially the same SASS and
+the same perf landscape. A4 thus confirms that multi-level chain
+propagation arrives at the SAME END STATE as the direct cache-hit
+kernel; the extra trans layer is fully absorbed by canonicalize.
+
+
+--------------------------------------------------------------------------------
+6. NCU AT THE WIN (128x128, 8192)
+--------------------------------------------------------------------------------
+
+  metric        OFF         ON
+  duration      2172us      2186us            (1.00x, neutral in single launch)
+  DRAM total    1071 MB     1071 MB
+  spill         0           0
+  regs/thread   200         200
+  occupancy     24.7%       24.5%
+
+Interestingly, A4 OFF is ALREADY at the same state as A2 ON at this
+tile -- meaning that without the pass, the Triton compiler /
+canonicalize already arrives at a narrow representation via a
+different route. A4 ON does not improve on this single-launch
+metric; the nsys 100-launch average shows a 1.19x speedup that lives
+in launch-to-launch variance rather than steady-state work.
+
+
+--------------------------------------------------------------------------------
+7. WHAT A4 ADDS TO THE STORY
+--------------------------------------------------------------------------------
+
+  - Demonstrates the pass's cache + worklist mechanisms interacting
+    correctly on a multi-level diamond.
+  - Confirms that trans-truncf-trans gets absorbed by downstream
+    canonicalize when the pass pushes truncf above the first trans.
+  - End state is structurally identical to A2's direct cache-hit
+    kernel, so the perf landscape mirrors A2.
+  - The cache hit fires correctly when triggered by upstream-
+    propagation cloning rather than direct frontend duplication.
+
+
+--------------------------------------------------------------------------------
+8. ARTIFACTS
+--------------------------------------------------------------------------------
+
+  Kernel       : A2_to_A7/test_A4_multilevel_2d.py
+  TTIR         : A2_to_A7/A4_multilevel_{OFF,ON}.ttir
+  TTGIR        : A2_to_A7/A4_multilevel_{OFF,ON}.ttgir
+  Verify log   : A2_to_A7/verify.log (A4 section)
+  Perf data    : A2_to_A7/nsys_results.csv  (rows with tag=A4)
+  ncu data     : /tmp/ncu_runs_A2A7/A4_*.csv

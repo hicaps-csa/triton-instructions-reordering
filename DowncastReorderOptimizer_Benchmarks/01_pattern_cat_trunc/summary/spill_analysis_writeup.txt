@@ -1,0 +1,489 @@
+================================================================================
+  cat_trunc_2d @ M=N=8192, BLOCK_M=BLOCK_N=128 (MID config)
+  Spill-removal pass: verification & attribution write-up
+================================================================================
+
+Inputs to this write-up:
+  - ncu_results_2d.txt  (4 configs x {OFF, ON} ncu summary)
+  - test_cat_trunc_2d.py
+  - /tmp/ncu_runs_cat_trunc_2d/{OFF,ON}_mid_128x128.{ncu-rep,csv}
+  - /tmp/verify_cat_trunc/{OFF,ON}/{kernel.cubin, kernel.sass, kernel.ptx,
+    kernel.ttir, kernel.ttgir, kernel.llir, kernel.json, out.pt, launch.json}
+
+
+================================================================================
+1.  PER-METRIC EXPLANATION FOR THE MID CONFIG (128 x 128)
+================================================================================
+
+Metric                 OFF        ON       Meaning
+----------------------------------------------------------------------
+Kernel duration        1886 us    1477 us  Wall time per launch. 1.28x speedup.
+
+Regs/thread (used)     255        218      Register footprint per thread. 255
+                                           is the per-thread cap on NVIDIA
+                                           GPUs - hitting it means the compiler
+                                           ran out and spilled. ON fits in 218,
+                                           no spill.
+
+Regs/thread (alloc)    32,768     28,672   Per-block allocation = used x 128
+                                           threads, rounded to allocation
+                                           granule.
+
+Occ. limit (regs)      2          2        Max blocks per SM given register
+                                           usage. Both are register-bound to
+                                           2 blocks/SM.
+
+Occ. limit (max)       8          8        Hardware cap. Not the binding
+                                           constraint here.
+
+Waves / SM             30.12      30.12    grid_blocks / (active_blocks_per_SM
+                                           x SMs). Identical -> same launch
+                                           shape.
+
+Achieved occupancy     24.06 %    24.79 %  Avg active warps / max. Essentially
+                                           unchanged - speedup is NOT from
+                                           occupancy.
+
+SM (compute) thrpt     6.72 %     6.23 %   Compute pipes utilization. Tiny -
+                                           kernel is memory-bound, not
+                                           math-bound.
+
+Memory thrpt           77.12 %    83.74 %  Highest of {DRAM, L1, L2, shared}
+                                           normalized to peak. ON pushes more
+                                           useful bytes per unit time.
+
+DRAM thrpt             77.12 %    83.74 %  DRAM is the bottleneck
+                                           (DRAM% = Memory%). ON is closer to
+                                           peak HBM bandwidth.
+
+L2 thrpt               28.65 %    30.18 %  Barely moves. (Discussed below.)
+
+Local-mem LD/ST        933,888    0        Spill reads/writes. Going to zero
+                                           is the headline change.
+
+Total inst executed    25.9M      20.1M    ON has ~5.85M fewer instructions
+                                           (~ removed spill loads/stores +
+                                           their address arithmetic).
+                                           0.77x inst count ~ 0.78x wall time.
+
+Stalls - lg_throttle     4,417    3,037    Local/global throughput throttle.
+                                           Drop is consistent with less local-
+                                           memory traffic.
+
+Stalls - long_scoreboard 11,436  24,245    Waiting on global loads. Goes UP
+                                           because the kernel is now mostly
+                                           waiting on real data (which is what
+                                           you want - those waits are
+                                           unavoidable).
+
+Stalls - barrier         2,716    2,450    __syncthreads waits. Slightly
+                                           lower.
+
+Stalls - short_scoreboard  688      190    Waiting on shared/short-latency
+                                           ops. Drops with spill removal.
+
+Clean story: occupancy is fixed at 2 blocks/SM in both versions, so the only
+thing that changed is what each warp does - fewer instructions and less
+local-mem pressure -> faster.
+
+
+================================================================================
+2.  HOW TO PROVE THE SPEEDUP IS FROM SPILL REDUCTION (original 7 steps)
+================================================================================
+
+The compact summary is suggestive but not airtight. To nail it down:
+
+  (1) Diff the SASS. cuobjdump --dump-sass on both kernels and confirm the
+      only deltas are LDL/STL (local memory) ops + their address arithmetic.
+      If you see different LDG/STG, different IMAD/FFMA mixes, or reordered
+      tile loops, then something else also changed.
+
+  (2) Check the instruction-count math. Removed inst = 5,849,088.
+      Spill removed = 1,867,776 reqs. Each spill round-trip = LDL + STL +
+      address calc + maybe a dependent move -> ratio of ~3.1 inst per spill
+      req, which lines up. If the ratio is way off, something else got
+      optimized.
+
+  (3) Confirm identical I/O. Same grid, same block, same total bytes loaded
+      from global. ncu's dram__bytes_read.sum and dram__bytes_write.sum should
+      match between OFF/ON within noise.
+
+  (4) Bit-exact output check. Run both kernels on the same input and
+      torch.equal the outputs.
+
+  (5) Lock the launch config. Set num_warps, num_stages, and any autotuner-
+      controlled params explicitly so the only difference between runs is the
+      pass.
+
+  (6) Subtract the spill cost analytically. OFF spent X cycles on LDL/STL
+      (~ stall_lg_throttle + a fraction of long_scoreboard). If
+      OFF_duration - spill_cost ~ ON_duration, the speedup is fully accounted
+      for by spill removal.
+
+  (7) Stall-shift sanity. ON should show less lg_throttle and less
+      short_scoreboard (it does). It can show more long_scoreboard (it does -
+      11k -> 24k) because the warps are no longer artificially serialized by
+      the spill-induced LSU contention; they expose the real global-memory
+      latency, which is fine.
+
+
+================================================================================
+3.  ACTUAL VERIFICATION RESULTS (MID config, ran the 7 steps)
+================================================================================
+
+Setup: pass is toggled by the env var TRITON_DISABLE_DOWNCAST_REORDER_OPTIMIZER.
+        unset                                          -> pass ON
+        TRITON_DISABLE_DOWNCAST_REORDER_OPTIMIZER=1    -> pass OFF
+The variable is read at runtime in
+/home/pushpendram/compiler/triton/python/triton/backends/nvidia/compiler.py
+inside make_ttir; no rebuild required.
+
+Procedure:
+  - With pass ON: wipe ~/.triton/cache, run capture script, save out.pt +
+    cubin + ptx + ttir + ttgir + llir to /tmp/verify_cat_trunc/ON/.
+  - With pass OFF: same, into /tmp/verify_cat_trunc/OFF/.
+  - Restore pass ON at end.
+
+Triton-side compiled metadata (matches ncu exactly):
+  OFF: n_regs=255, n_spills=46
+  ON:  n_regs=218, n_spills=0
+
+
+--- SASS opcode histograms (cuobjdump --dump-sass) ---
+
+  Opcode (per-thread)       OFF    ON     Delta
+  --------------------------------------------
+  F2F.F16.F32               256    256    0       (fp32->fp16 truncation)
+  PRMT                      128    256    +128    (ON adds warp-level permutes)
+  CS2R                      128    128    0
+  BAR.SYNC                  127    63     -64     (ON halves barriers)
+  LOP3.LUT                  115    37     -78
+  IMAD.WIDE.U32             96     96     0
+  IMAD                      66     66     0
+  STS.128                   64     32     -32     (ON halves shared stores)
+  LDSM.16.M88.4             64     32     -32     (ON halves shared loads)
+  LDG.E.128.SYS             64     64     0       (same global reads)
+  IMAD.WIDE                 64     64     0
+  LDL.LU                    45     0      -45     (spill loads gone)
+  S2R                       35     2      -33
+  STL                       33     0      -33     (spill stores gone)
+  USHF.L.U32                32     2      -30
+  STG.E.128.SYS             32     32     0       (same global writes)
+  LEA.HI.X.SX32             32     32     0
+  LEA                       32     32     0
+  IMAD.SHL.U32              22     4      -18
+  ISETP.LT.AND              16     16     0
+  STL.64                    12     0      -12     (more spill stores gone)
+
+  Same: LDG (64), STG (32), F2F (256), IMAD (66), IMAD.WIDE.U32 (96), LEA (32)
+  Removed: LDL.LU (45), STL (33), STL.64 (12)  -> all spill traffic
+  Halved : BAR.SYNC, LDSM.16.M88.4, STS.128
+  Doubled: PRMT (ON does the cat via register permutes instead of via shmem)
+  Cut    : LOP3.LUT (115->37), IMAD.SHL.U32 (22->4), S2R, USHF.L.U32
+
+
+--- Bit-exact correctness ---
+
+  shape OFF=(8192, 16384) dtype=torch.float16
+  shape ON =(8192, 16384) dtype=torch.float16
+  bit-exact equal      : True
+  bit-different elements: 0 / 134,217,728
+  max abs diff (fp16)  : 0.0
+
+
+--- ncu metric extraction from /tmp/ncu_runs_cat_trunc_2d/*_mid_128x128.csv ---
+
+  metric                                              OFF              ON
+  --------------------------------------------------------------------------
+  gpc__cycles_elapsed.max                       2,545,041       1,983,787
+  gpu__time_duration.sum (ms)                    1.886336        1.477344
+  dram__bytes_read.sum (MB)                       566.584         536.941
+  dram__bytes_write.sum (MB)                      381.593         265.530
+  dram__bytes.sum.per_second (GB/s)              502.655         543.185
+  smsp__inst_executed.sum                      25,919,488      20,070,400
+  l1tex local LD requests                         933,888               0
+  l1tex local ST requests                         933,888               0
+  launch__registers_per_thread                        255             218
+  launch__waves_per_multiprocessor                  30.12           30.12
+  warps_active.pct_of_peak_sustained_active     24.0587%        24.7908%
+
+  DRAM totals: OFF=948.18 MB, ON=802.47 MB, delta=-145.71 MB
+  Theoretical algorithmic I/O:
+      reads  = 2*8192*8192*4 B = 512 MB (A and B fp32)
+      writes = 8192*16384*2 B = 256 MB  (fp16 output)
+      total  = 768 MB
+  Spill traffic max bound:
+      reqs    = 933,888 LD + 933,888 ST = 1,867,776
+      bytes   = 1,867,776 * 128 B/req-wavefront = 239.1 MB upper bound
+  Inst delta = 5,849,088;  per-warp delta = 5,849,088 / (4096*4 warps) = 357.0
+
+
+--- Spill-cost subtraction ---
+
+  duration delta = 409 us
+  DRAM bytes saved = 145.7 MB
+  at ON's effective rate (543.2 GB/s) -> 268.2 us of bandwidth time
+
+  So roughly:
+      409 us total delta
+      ~268 us attributable to less DRAM traffic
+      ~140 us residual, plausibly from fewer barriers + halved smem traffic
+
+
+================================================================================
+4.  VERDICT PER ORIGINAL CLAIM (with evidence)
+================================================================================
+
+#  Claim                                             Verdict   Evidence
+-----------------------------------------------------------------------
+1  SASS deltas are only LDL/STL + address arith     NOT TRUE  LDG/STG/F2F
+                                                              identical, but
+                                                              the pass also
+                                                              halves BAR.SYNC
+                                                              (127->63), halves
+                                                              LDSM/STS (64->32),
+                                                              doubles PRMT
+                                                              (128->256), cuts
+                                                              LOP3 (115->37).
+                                                              Pass restructured
+                                                              the cat lowering,
+                                                              did not just
+                                                              remove spills.
+
+2  ~3.1 inst per spill round-trip explains delta    NOT TRUE  Per-warp inst
+                                                              delta = 357.
+                                                              Spill ops removed
+                                                              per thread ~ 90
+                                                              (LDL+STL+STL.64).
+                                                              Remaining ~265
+                                                              per-thread savings
+                                                              come from halved
+                                                              barriers/smem and
+                                                              LOP3/IMAD cleanup.
+
+3  Identical DRAM bytes (only spill differs)        NOT TRUE  OFF=948 MB,
+                                                              ON=802 MB,
+                                                              delta=146 MB.
+                                                              Spill bytes do
+                                                              reach DRAM
+                                                              (especially
+                                                              writes: -116 MB
+                                                              write vs -30 MB
+                                                              read). LDG/STG
+                                                              SASS counts are
+                                                              identical, so the
+                                                              algorithm is
+                                                              unchanged; the
+                                                              delta is spill-
+                                                              induced, not
+                                                              algorithm-induced.
+
+4  Bit-exact output                                 CONFIRMED torch.equal=True,
+                                                              0/134M diffs,
+                                                              max|diff|=0.0.
+
+5  Launch config locked                             CONFIRMED num_warps=4,
+                                                              num_stages=3,
+                                                              grid=4096,
+                                                              BLOCK=128x128.
+                                                              Compiled regs
+                                                              /spills match
+                                                              ncu (255/46 vs
+                                                              218/0).
+
+6  Spill-cost subtraction explains the speedup     RIGHT      Delta = 409 us.
+   (analytically)                                  BALLPARK   DRAM saved = 146
+                                                              MB / 543 GB/s =
+                                                              268 us. Residual
+                                                              ~140 us plausibly
+                                                              from halved
+                                                              barriers + smem.
+                                                              Consistent in
+                                                              sign + magnitude;
+                                                              not a clean
+                                                              single-number
+                                                              subtraction.
+
+7  Stall shifts in expected direction              CONFIRMED  lg_throttle
+                                                              4417->3037 (drop),
+                                                              short_scoreboard
+                                                              688->190 (drop),
+                                                              long_scoreboard
+                                                              11436->24245
+                                                              (rise; warps now
+                                                              expose real
+                                                              global-mem
+                                                              latency).
+                                                              barrier 2716->
+                                                              2450 (drop,
+                                                              consistent with
+                                                              halved BAR.SYNC).
+
+
+================================================================================
+5.  REFINED STORY
+================================================================================
+
+The headline "speedup is from spill removal" is half right. The pass eliminates
+all 1.87M spill requests, but it does so by RESTRUCTURING THE CAT-TRUNC
+LOWERING to use warp-level shuffles (PRMT) instead of a shared-memory
+round-trip. That restructuring also:
+  - halves shared-memory traffic (STS.128/LDSM.16: 64 -> 32 each per thread)
+  - halves __syncthreads barriers (127 -> 63 per thread)
+  - removes the 146 MB of spill DRAM traffic that L1 couldn't absorb
+
+So the correct claim is:
+
+    "The pass replaces a shared-memory-staged, register-spilling cat lowering
+    with a register/permute-staged lowering; the headline metrics that move
+    (spill, BAR.SYNC, LDSM/STS, DRAM bytes) are all downstream of that single
+    structural change."
+
+Bit-exactness and identical LDG/STG/F2F counts prove the user-visible
+computation is unchanged.
+
+
+================================================================================
+6.  CAN WE DETERMINISTICALLY CONCLUDE THIS?
+================================================================================
+
+No - and here is the precise distinction.
+
+DETERMINISTIC CONCLUSIONS (things measurement + SASS proves outright):
+
+  (a) Same function computed.
+      torch.equal(OFF, ON) == True, 0/134M differing elements.
+      The pass does not change what the kernel computes.
+
+  (b) Same algorithmic global I/O.
+      SASS opcode counts for LDG.E.128 (64), STG.E.128 (32), and
+      F2F.F16.F32 (256) are identical. The kernel loads the same bytes from
+      global, writes the same bytes back, and performs exactly the same number
+      of fp32->fp16 conversions in both versions.
+
+  (c) Same launch config.
+      num_warps=4, num_stages=3, grid=4096, BLOCK_M=BLOCK_N=128.
+      Compiled-side regs/spills (255/46 vs 218/0) match ncu exactly.
+
+  (d) Pass restructured the cat lowering, not the surrounding tile code.
+      The only opcodes whose counts changed are the ones involved in routing
+      data through the cat operation (LDL/STL/STS/LDSM/PRMT/BAR.SYNC/LOP3/
+      IMAD.SHL). Math and global I/O are byte-identical.
+
+CAUSALLY INFERENTIAL (not deterministic):
+
+  (e) "The speedup is from spill removal."
+      Falsified as a standalone claim - spill removal is one of several
+      coupled effects of a single IR rewrite (also fewer barriers, halved
+      shared-mem traffic, more PRMT, less DRAM traffic).
+
+  (f) "X% of the 409 us delta comes from spills, Y% from barriers, Z% from
+      shared-mem."
+      Not deterministically attributable from the data we have. The mechanisms
+      are tangled because they are all consequences of one structural change.
+      The 268 us of saved DRAM time + ~140 us residual is consistent with the
+      story but does not prove the decomposition.
+
+WHY WE CANNOT DECOMPOSE DETERMINISTICALLY:
+
+The pass performs a single atomic IR rewrite that produces all four downstream
+effects simultaneously. To isolate them, you would need to vary one at a time
+- but you cannot toggle "remove spills without changing barrier count,"
+because in this kernel the spills ARE the barriers (the cat goes through
+shared mem; less staging means both fewer LDL/STL and fewer BAR.SYNC).
+
+CLOSEST APPROACHES TO A DETERMINISTIC ATTRIBUTION (increasing rigor):
+
+  (1) Roofline argument.
+      ON's effective DRAM rate is 543 GB/s on a 2080Ti (peak ~616 GB/s) -
+      i.e., ON is at ~88% of bandwidth roof. There is no headroom for a
+      different compiler trick to make it materially faster on this hardware.
+      So OFF is slower because it spends cycles NOT on bandwidth - and ncu's
+      pipeline-cycle breakdown will show those cycles in LSU (spill traffic)
+      + barrier waits + SMEM ops. This BOUNDS the attribution: "the extra
+      time in OFF is entirely cycles spent on the mechanisms we removed;
+      there is no missing third cause."
+
+  (2) Per-pipeline cycle counters.
+      Re-collect with sm__pipe_lsu_cycles_active.avg.pct_of_peak,
+      smsp__cycles_active_pipe_*, and the per-warp-stall CYCLES (not raw
+      stall counts). These attribute kernel time to pipelines, and you can
+      subtract per pipeline OFF vs ON. That moves "spill cost ~ 268 us" from
+      "consistent in magnitude" to "directly measured."
+
+  (3) Controlled isolation.
+      Hand-write three Triton variants:
+        (a) status-quo OFF (spills + barriers + shared-mem stage),
+        (b) shared-mem stage but no spill (raise maxnreg or hand-shrink the
+            live range so it fits in 218 registers without changing the
+            lowering),
+        (c) pass ON (no spill, no shared-mem stage, more PRMT).
+      Then (a)->(b) measures spill cost alone and (b)->(c) measures
+      restructuring cost alone. This is the only way to truly decompose, and
+      it requires real work to construct (b).
+
+Without one of those, the strongest deterministic statement is the one in
+items (a)-(d) above. The decomposition into "spill vs. barrier vs. SMEM" is a
+coherent and quantitatively consistent story, but it is a model, not a proof.
+
+
+================================================================================
+7.  WHY L2 THROUGHPUT BARELY MOVED DESPITE THE SPILL DELTA
+================================================================================
+
+L2 thrpt: 28.65% (OFF) -> 30.18% (ON). Three reasons:
+
+  (1) Spill bytes are tiny next to real bytes.
+      1.87M spill reqs x ~128 B/warp = ~240 MB over 1.88 ms ~ 127 GB/s of
+      LOCAL traffic. The kernel is moving multi-hundred-MB tensors of real
+      data per launch, dominating L2/DRAM totals. Removing the spill changes
+      the L2 budget by a few percent - which is what you see (28.65 -> 30.18).
+
+  (2) Local memory hits L1, not L2.
+      Spill slots are per-thread and accessed with extreme reuse (same warp
+      keeps reading/writing the same offsets). On modern GPUs L1 (unified
+      with shared) absorbs nearly all of that. Only L1 misses reach L2, and
+      for tightly-reused spill slots the miss rate is low. So L2 hardly saw
+      the spill traffic in the first place - removing it does not change L2's
+      reading much.
+
+  (3) L2% rises slightly anyway because the kernel got faster.
+      L2 throughput is bytes/sec normalized to peak. The denominator (time)
+      shrank, so even with the same useful global-data traffic going through
+      L2, utilization ticks up. Same logic explains DRAM% rising 77% -> 84%:
+      real data bytes are roughly constant; the kernel just processes them
+      in less time.
+
+Note: in this kernel, our measurement showed that the spill writes DID partly
+reach DRAM (116 MB write delta). So claim (1) is more accurate as "spill
+WRITES partly missed L1 and reached DRAM; spill READS were largely absorbed
+by L1." Net L2 impact stays small either way.
+
+
+================================================================================
+8.  ARTIFACTS PRODUCED
+================================================================================
+
+/tmp/verify_cat_trunc/
+  capture.py                - Triton harness used to compile + run + dump
+  OFF/
+    out.pt                  - fp16 output tensor (8192 x 16384)
+    seed.txt                - RNG seed (0)
+    cubin_path.txt          - source path in ~/.triton/cache
+    kernel.cubin            - compiled cubin (pass OFF)
+    kernel.sass             - cuobjdump --dump-sass output
+    kernel.ptx              - PTX
+    kernel.ttir             - Triton IR (before pass)
+    kernel.ttgir            - Triton GPU IR
+    kernel.llir             - LLVM IR
+    kernel.json             - compile-side metadata
+    launch.json             - n_regs, n_spills, num_warps, num_stages, shared
+  ON/                       - same files, pass ON
+
+/tmp/ncu_runs_cat_trunc_2d/  - 4 configs x {OFF, ON} ncu captures
+  *.ncu-rep, *.csv, *.log
+
+Pass toggle (env var):
+  TRITON_DISABLE_DOWNCAST_REORDER_OPTIMIZER=1 -> OFF, unset -> ON.
+  Read by /home/pushpendram/compiler/triton/python/triton/backends/nvidia/compiler.py.
+  Final state: env var unset, pass ON.

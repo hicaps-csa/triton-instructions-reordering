@@ -1,0 +1,4 @@
+Pattern : 13_appendix_broadcast_trunc
+Report  : Section A.6 -- Broadcast -- Truncate
+Source  : triton_kernels/broadcast_trunc_2d/
+Files   : 9

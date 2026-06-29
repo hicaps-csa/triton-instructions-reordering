@@ -1,0 +1,4 @@
+Pattern : 03_pattern_dual_quant
+Report  : Section 6.7 -- Pattern 3: Multi-consumer (two-way)
+Source  : triton_kernels/dual_quant_2d/
+Files   : 18

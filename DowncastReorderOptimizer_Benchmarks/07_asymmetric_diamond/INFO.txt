@@ -1,0 +1,4 @@
+Pattern : 07_asymmetric_diamond
+Report  : Section 6.10.6 -- Asymmetric Diamond (relaxed gate)
+Source  : triton_kernels/asymmetric_diamond_trans_2d/
+Files   : 19

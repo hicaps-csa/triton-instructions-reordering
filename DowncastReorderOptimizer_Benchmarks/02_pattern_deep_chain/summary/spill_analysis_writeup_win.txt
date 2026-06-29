@@ -1,0 +1,299 @@
+================================================================================
+  deep_chain_2d @ M=N=8192, BLOCK_M=128, BLOCK_N=256 (WIN config)
+  Spill-removal pass: verification & attribution write-up
+================================================================================
+
+Chain: load(a,fp32), load(b,fp32) -> reshape -> reshape -> cat -> reshape
+       -> trans -> fptosi(i8) -> store
+
+Pass behavior: sink fp32->i8 trunc past the 4-deep mover chain so the chain
+runs in i8 instead of fp32.
+
+Inputs to this write-up:
+  - ncu_results_2d.txt
+  - nsys_results_2d.txt
+  - test_deep_chain_2d.py
+  - /tmp/ncu_runs_deep_chain/{OFF,ON}_win_128x256.{ncu-rep,csv}
+  - /tmp/verify_deep_chain/{OFF_win, ON_win, OFF_neutral, ON_neutral}/
+      {kernel.cubin, kernel.sass, kernel.ptx, kernel.ttir, kernel.ttgir,
+       kernel.llir, kernel.json, out.pt, sha256.txt, launch.json}
+
+
+================================================================================
+1.  HEADLINE: 7.31x speedup at WIN, 1.00x at NEUTRAL
+================================================================================
+
+  Config    Pass    Dur us   Reg   Occ %   Mem %   DRAM %   L2 %    Spill LD     Spill ST
+  -----------------------------------------------------------------------------------------
+  neutral   OFF    1230.88    72   85.4%   83.7%   83.7%   30.2%           0           0
+  neutral   ON     1230.24    64   97.8%   83.5%   83.5%   30.1%           0           0
+  win       OFF    9009.41    64   94.6%   70.7%   70.7%   25.9%       13.4M       14.1M
+  win       ON     1232.70   203   24.8%   83.4%   83.4%   30.1%           0           0
+
+NEUTRAL is a clean control: zero spill in either pass state -> zero time delta.
+WIN: 7.31x speedup is the headline; we attribute it below.
+
+
+================================================================================
+2.  SASS OPCODE DIFF (WIN, per-thread counts from cuobjdump --dump-sass)
+================================================================================
+
+  Opcode                       OFF    ON   Delta   Note
+  ----------------------------------------------------------------------
+  LDG.E.128.SYS               128   128   +0       same global loads
+  STG.E.128.SYS                32    32   +0       same global stores
+  F2I.S16.TRUNC.NTZ           512   512   +0       same fp32->i8 conversions
+  LDL.LU                     1444     0   -1444    all spill reads gone
+  LDL.LU.64                    97     0   -97      ...
+  LDL                           1     0   -1       ...
+  LDL.64                        1     0   -1       ...
+  STL                         754     0   -754     all spill writes gone
+  STL.64                      485     0   -485     ...
+  BAR.SYNC                    255    63   -192     4x barrier reduction
+  LDSM.16.M88.4               128    32   -96      4x shared-mem load reduction
+  STS.128                     128    32   -96      4x shared-mem store reduction
+  PRMT                        392   770   +378     warp permutes replace shmem
+  IMAD.MOV.U32                383     2   -381     spill addr arith gone
+  LOP3.LUT                    609   601   -8       roughly unchanged
+  CS2R                        208   256   +48
+  IMAD.WIDE.U32               129   128   -1
+  IMAD.WIDE                   129   128   -1
+  IMAD                         98    97   -1
+
+Unchanged (algorithm preserved): LDG, STG, F2I, IMAD, LEA, ISETP
+Eliminated: LDL.* (1543 ops gone), STL.* (1239 ops gone)
+Halved x4: BAR.SYNC, LDSM.16, STS.128
+Doubled (replaces shmem): PRMT (cat done via warp permutes now)
+Cleaned up: IMAD.MOV.U32 (spill address arithmetic)
+
+Compare to cat_trunc_2d MID: that pass reduced shmem/barriers by 2x. Here
+they are reduced by 4x because the chain has 4 movers (reshape -> cat ->
+reshape -> trans), each of which forced a shared-mem round-trip in OFF mode.
+
+
+================================================================================
+3.  BIT-EXACT CORRECTNESS (sha256 of full output tensor)
+================================================================================
+
+  Config              OFF sha256       ON sha256        Match
+  -----------------------------------------------------------
+  WIN (128, 256)      9ccd9435..5643   9ccd9435..5643   YES
+  NEUTRAL (64, 64)    80c07990..fb31   80c07990..fb31   YES
+
+  Also the project's existing verify.log shows OFF == ON for 4 smaller-M
+  configs (M=N in {1024, 2048, 4096}). All match.
+
+
+================================================================================
+4.  NCU METRICS (auto-scaled units in raw CSV -- normalized here)
+================================================================================
+
+                    OFF_win    ON_win    OFF_neu    ON_neu
+  ----------------------------------------------------------
+  duration          9009 us   1233 us   1231 us   1230 us
+  DRAM read         2.23 GB   537 MB    537 MB    537 MB
+  DRAM write        1.93 GB   131 MB    131 MB    131 MB
+  DRAM total        4.16 GB   668 MB    668 MB    668 MB
+  inst              50.05M    24.08M    25.95M    25.95M
+  reg/thread        64        203       72        64
+  spill LD reqs     13.44M    0         0         0
+  spill ST reqs     14.12M    0         0         0
+  achieved occ      94.6%     24.8%     85.4%     97.8%
+
+  Theoretical algorithmic I/O = 2*M*N*4 (read A,B) + M*2N*1 (write i8)
+                              = 512 MB + 134 MB = 646 MB
+                              (with ncu overhead ~ 671 MB)
+
+  NEUTRAL is a perfect control: OFF and ON have identical DRAM bytes AND
+  identical instruction counts. The pass is a no-op when there is nothing
+  to spill / restructure.
+
+  WIN OFF moves 4.16 GB; theoretical is 671 MB -> 3.49 GB is pure spill
+  traffic reaching DRAM. The 27.6M spill requests x 128 B/wavefront =
+  3.53 GB upper bound. Measured 3.49 / 3.53 -> L1 absorbed ~1% of spill
+  traffic; the rest went all the way to DRAM. (Very different from
+  cat_trunc_2d MID, where L1 absorbed ~40% of spill traffic.)
+
+  Top warp-stall reasons (raw counts; lower = better)
+                     OFF        ON          delta
+  ---------------------------------------------------
+  lg_throttle      135,033     1,723       -98.7%
+  long_scoreboard   46,217    45,622       flat (already on the roof)
+  barrier           14,742     2,563       -82.6%
+  wait                 940     2,313       +146%   (more warps now waiting
+                                                    productively on global)
+
+  lg_throttle drop of 99% directly confirms removal of local-mem (spill)
+  LSU contention.
+
+
+================================================================================
+5.  SPILL-COST SUBTRACTION (WIN)
+================================================================================
+
+  duration delta : 7777 us
+  DRAM saved     : 3.49 GB
+  at ON rate (542.2 GB/s) -> 6436 us of bandwidth time
+  residual       : 1340 us (~17%)
+
+  => 83% of the speedup is directly attributable to the eliminated DRAM
+     bandwidth on spill traffic. The remaining ~17% lines up with the 4x
+     cuts in BAR.SYNC + LDSM + STS + IMAD.MOV.
+
+
+================================================================================
+6.  INSTRUCTION-COUNT ACCOUNTING (per warp)
+================================================================================
+
+  Per-warp inst delta = (50,053,120 - 24,076,288) / (2048 blocks * 4 warps)
+                      = 3171 inst/warp removed
+
+  Mechanism                                Per-warp inst removed
+  ---------------------------------------------------------------
+  Spill ops (LDL/STL family)               ~2782   (88%)
+  Barrier / SMEM / IMAD.MOV cleanup        ~ 765
+  PRMT + CS2R added back                   - 426
+  ---------------------------------------------------------------
+  Net                                      ~3121   (matches 3171 within
+                                                    rounding)
+
+  Spill removal is 88% of the instruction delta. For cat_trunc_2d MID, that
+  ratio was only ~25%. Here the spill component is dominant, making the
+  attribution cleaner.
+
+
+================================================================================
+7.  VERDICT PER ORIGINAL 7-STEP PLAN (with evidence)
+================================================================================
+
+  #  Claim                                    Verdict      Evidence
+  ----------------------------------------------------------------
+  1  SASS deltas = only spill ops + addr      PARTIALLY    LDG/STG/F2I
+                                              TRUE         identical, but
+                                                           pass also cuts
+                                                           BAR.SYNC, LDSM,
+                                                           STS by 4x and
+                                                           doubles PRMT.
+
+  2  ~3.1 inst per spill req                  TIGHTER      88% of inst
+                                              HERE         delta is spill
+                                                           ops directly.
+
+  3  Identical DRAM bytes (only spill         FALSE        OFF has +3.49 GB
+     differs)                                              of spill traffic
+                                                           that L1 did NOT
+                                                           absorb (only ~1%
+                                                           absorbed). Most
+                                                           spill bytes
+                                                           reached DRAM.
+
+  4  Bit-exact output                         CONFIRMED    sha256 match for
+                                                           WIN and NEUTRAL.
+
+  5  Locked launch config                     CONFIRMED    num_warps=4,
+                                                           num_stages=3,
+                                                           grid=2048,
+                                                           BLOCK=128x256.
+
+  6  Spill cost ~ duration delta              MOSTLY       6436 us of
+                                              EXPLAINED    7777 us (83%)
+                                                           from DRAM saved.
+
+  7  Stall shifts in expected direction       CONFIRMED    lg_throttle
+                                                           drops 99%,
+                                                           barrier drops
+                                                           83%, long_scbd
+                                                           flat (on roof).
+
+
+================================================================================
+8.  CAN WE DETERMINISTICALLY CONCLUDE THIS?
+================================================================================
+
+For deep_chain WIN, the answer is closer to "yes" than for cat_trunc MID,
+because:
+
+  (a) NEUTRAL (64, 64) is a clean control with identical DRAM, identical
+      instructions, identical sha256, and identical duration. The pass does
+      nothing when there is nothing to fix. This proves the pass cannot
+      *introduce* a speedup absent spills.
+
+  (b) 88% of the per-warp instruction delta at WIN is literally spill
+      load/store opcodes. The "spills cause the slowdown" story is
+      directly visible in the SASS diff.
+
+  (c) 83% of the wall-time delta at WIN is accounted for by the saved DRAM
+      bandwidth alone, computed as (3.49 GB saved) / (542 GB/s on ON).
+
+  (d) The remaining 17% time and 12% inst delta is consistent with the 4x
+      shared-mem and barrier reductions, which are a coupled side effect of
+      the same IR rewrite that removes the spill.
+
+DETERMINISTIC:
+  - Bit-exactness (sha256).
+  - Same algorithmic global I/O (SASS LDG/STG/F2I).
+  - Same launch config.
+  - Spill ops dominate the inst delta (88%).
+  - DRAM-saved time dominates the wall-time delta (83%).
+  - NEUTRAL control shows the pass has no effect without spills.
+
+NOT DETERMINISTIC (still inferential):
+  - The exact partition of the 17% residual time between "fewer barriers",
+    "fewer LDSM/STS", and "fewer IMAD.MOV". These coupled mechanisms still
+    can not be cleanly separated without a hand-written intermediate
+    variant.
+
+So compared to cat_trunc MID (where spill explains only ~25% of inst delta
+and ~65% of time delta), deep_chain WIN is a much cleaner case: most of the
+speedup is straightforwardly bandwidth savings from removed spill traffic.
+
+
+================================================================================
+9.  WHY THE NUMBERS ARE SO MUCH MORE DRAMATIC THAN cat_trunc
+================================================================================
+
+Three reasons:
+
+  (1) Larger live range. The 4-mover chain holds more values live across
+      more shuffles, so the spill set is bigger. OFF spills 27.6M reqs vs
+      cat_trunc OFF's 1.87M reqs (~15x).
+
+  (2) L1 is overwhelmed. With 14M spill requests bouncing through L1 over
+      9 ms, the reuse window is destroyed; ~99% of spill bytes hit DRAM.
+      In cat_trunc, only 60% reached DRAM. This is a function of working
+      set size vs L1 capacity.
+
+  (3) More movers to collapse. The pass replaces 4 shared-mem-staged
+      movers with register/permute movers, hence the 4x BAR/LDSM/STS
+      reduction (vs cat_trunc's 2x for a single mover).
+
+The net effect is that for deep_chain at WIN, spill removal is both
+mechanically (88% of inst) and quantitatively (83% of time) the dominant
+cause of the speedup.
+
+
+================================================================================
+10. ARTIFACTS PRODUCED
+================================================================================
+
+/tmp/verify_deep_chain/
+  capture.py
+  OFF_win/        - cubin, SASS, ptx, ttir, ttgir, llir, out.pt, sha256.txt
+  ON_win/         - same
+  OFF_neutral/    - same
+  ON_neutral/     - same
+
+/tmp/ncu_runs_deep_chain/      - 3 configs x {OFF, ON} ncu captures
+  *.ncu-rep, *.csv, *.log
+
+Compile metadata (matches ncu exactly):
+  OFF_win:     n_regs=64,  n_spills=916
+  ON_win:      n_regs=203, n_spills=0
+  OFF_neutral: n_regs=72,  n_spills=0
+  ON_neutral:  n_regs=64,  n_spills=0
+
+Pass toggle:
+  Env var TRITON_DISABLE_DOWNCAST_REORDER_OPTIMIZER (unset = ON, =1 = OFF),
+  read at runtime by make_ttir in
+  /home/pushpendram/compiler/triton/python/triton/backends/nvidia/compiler.py.
+  Final state: env var unset, pass ON.

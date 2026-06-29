@@ -1,0 +1,184 @@
+================================================================================================
+  ncu detailed profiling -- 2-D multi_consumer_trans_trunc_2d_kernel @ M = N = 8192
+  4 configs (neutral / mid / win / big) x 2 pass states (one launch profiled per run)
+  Shared mover : tt.trans (fp32) -> { fptosi -> i8 store, truncf -> fp16 store }
+================================================================================================
+
+Configurations
+------------------------------------------------------------------------------------------------
+  neutral  : (BLOCK_M, BLOCK_N) = (64, 64)  tile = 4096
+  mid      : (BLOCK_M, BLOCK_N) = (128, 128)  tile = 16384
+  win      : (BLOCK_M, BLOCK_N) = (128, 256)  tile = 32768
+  big      : (BLOCK_M, BLOCK_N) = (256, 256)  tile = 65536
+
+=== NEUTRAL  (BLOCK_M, BLOCK_N) = (64, 64)  tile = 4096 ===
+
+  Metric                                          OFF                 ON           Delta
+  ------------------------------------------------------------------------------------------
+  Kernel duration                        888864.00 us       890400.00 us           1.00x
+  Regs/thread (used)                               72                 72           1.00x
+  Regs/thread (alloc)                           9,216              9,216           1.00x
+  Occ. limit (regs)                                 7                  7           1.00x
+  Occ. limit (max)                                  8                  8           1.00x
+  Waves / SM                                    34.42              34.42           1.00x
+  Achieved occupancy                          85.22 %            85.92 %       +0.70 ppt
+  SM (compute) thrpt                          11.38 %            11.39 %       +0.01 ppt
+  Memory thrpt                                81.66 %            81.66 %       -0.00 ppt
+  DRAM thrpt                                  81.66 %            81.66 %       -0.00 ppt
+  L2 thrpt                                    29.09 %            29.10 %       +0.01 ppt
+  Local-mem LD reqs (spill rd)                      0                  0                
+  Local-mem ST reqs (spill wr)                      0                  0                
+  Total inst executed                      22,478,848         22,478,848           1.00x
+  Block size (threads)                            128                128           1.00x
+  Grid size (blocks)                           16,384             16,384           1.00x
+
+  Top warp-stall reasons (raw counts; higher = more stalled)
+    Reason                               OFF              ON
+    long_scoreboard                    7,267           7,100
+    barrier                            5,065           4,993
+    lg_throttle                        3,464           3,535
+    short_scoreboard                   2,969           3,058
+    drain                              1,052           1,122
+    wait                                 835             821
+    selected                             463             472
+    math_pipe_throttle                    87              87
+
+=== MID  (BLOCK_M, BLOCK_N) = (128, 128)  tile = 16384 ===
+
+  Metric                                          OFF                 ON           Delta
+  ------------------------------------------------------------------------------------------
+  Kernel duration                        947584.00 us       945920.00 us           1.00x
+  Regs/thread (used)                              168                168           1.00x
+  Regs/thread (alloc)                          21,504             21,504           1.00x
+  Occ. limit (regs)                                 3                  3           1.00x
+  Occ. limit (max)                                  8                  8           1.00x
+  Waves / SM                                    20.08              20.08           1.00x
+  Achieved occupancy                          36.59 %            37.07 %       +0.48 ppt
+  SM (compute) thrpt                           9.58 %             9.52 %       -0.05 ppt
+  Memory thrpt                                81.23 %            80.76 %       -0.47 ppt
+  DRAM thrpt                                  81.23 %            80.76 %       -0.47 ppt
+  L2 thrpt                                    26.78 %            26.62 %       -0.15 ppt
+  Local-mem LD reqs (spill rd)                      0                  0                
+  Local-mem ST reqs (spill wr)                      0                  0                
+  Total inst executed                      20,594,688         20,594,688           1.00x
+  Block size (threads)                            128                128           1.00x
+  Grid size (blocks)                            4,096              4,096           1.00x
+
+  Top warp-stall reasons (raw counts; higher = more stalled)
+    Reason                               OFF              ON
+    long_scoreboard                    9,100           8,544
+    lg_throttle                        6,265           6,255
+    short_scoreboard                   5,240           5,232
+    barrier                            2,929           2,739
+    wait                               1,539           1,597
+    selected                             872             889
+    drain                                468             560
+    math_pipe_throttle                   120             100
+
+=== WIN  (BLOCK_M, BLOCK_N) = (128, 256)  tile = 32768 ===
+
+  Metric                                          OFF                 ON           Delta
+  ------------------------------------------------------------------------------------------
+  Kernel duration                          6120.42 us         5812.83 us           0.95x
+  Regs/thread (used)                               64                 64           1.00x
+  Regs/thread (alloc)                           8,192              8,192           1.00x
+  Occ. limit (regs)                                 8                  8           1.00x
+  Occ. limit (max)                                  8                  8           1.00x
+  Waves / SM                                     7.53               7.53           1.00x
+  Achieved occupancy                          49.03 %            48.89 %       -0.14 ppt
+  SM (compute) thrpt                           5.82 %             5.71 %       -0.11 ppt
+  Memory thrpt                                64.73 %            64.02 %       -0.71 ppt
+  DRAM thrpt                                  64.73 %            64.02 %       -0.71 ppt
+  L2 thrpt                                    23.33 %            23.11 %       -0.22 ppt
+  Local-mem LD reqs (spill rd)              8,847,360          8,208,384           0.93x
+  Local-mem ST reqs (spill wr)              8,093,696          7,618,560           0.94x
+  Total inst executed                      35,119,104         33,718,272           0.96x
+  Block size (threads)                            128                128           1.00x
+  Grid size (blocks)                            2,048              2,048           1.00x
+
+  Top warp-stall reasons (raw counts; higher = more stalled)
+    Reason                               OFF              ON
+    long_scoreboard                  155,073         169,665
+    lg_throttle                      101,836          75,238
+    barrier                            8,385           7,992
+    short_scoreboard                   3,523           2,736
+    wait                               2,134           2,074
+    selected                           1,118           1,086
+    drain                                155             115
+    imc_miss                              43              55
+
+=== BIG  (BLOCK_M, BLOCK_N) = (256, 256)  tile = 65536 ===
+
+  Metric                                          OFF                 ON           Delta
+  ------------------------------------------------------------------------------------------
+  Kernel duration                          4909.82 us         4936.86 us           1.01x
+  Regs/thread (used)                               64                 64           1.00x
+  Regs/thread (alloc)                           8,192              8,192           1.00x
+  Occ. limit (regs)                                 8                  8           1.00x
+  Occ. limit (max)                                  8                  8           1.00x
+  Waves / SM                                    15.06              15.06           1.00x
+  Achieved occupancy                          12.55 %            12.44 %       -0.11 ppt
+  SM (compute) thrpt                           6.77 %             6.78 %       +0.01 ppt
+  Memory thrpt                                73.08 %            75.56 %       +2.47 ppt
+  DRAM thrpt                                  73.08 %            75.56 %       +2.47 ppt
+  L2 thrpt                                    29.49 %            29.93 %       +0.45 ppt
+  Local-mem LD reqs (spill rd)              8,622,080          8,794,112           1.02x
+  Local-mem ST reqs (spill wr)              7,507,968          7,585,792           1.01x
+  Total inst executed                      32,239,616         32,321,536           1.00x
+  Block size (threads)                            128                128           1.00x
+  Grid size (blocks)                            1,024              1,024           1.00x
+
+  Top warp-stall reasons (raw counts; higher = more stalled)
+    Reason                               OFF              ON
+    long_scoreboard                  192,569         196,351
+    wait                               7,503           7,598
+    lg_throttle                        4,220           4,261
+    selected                           4,029           3,965
+    short_scoreboard                   3,607           3,437
+    barrier                            2,261           2,511
+    drain                                120             129
+    imc_miss                              19              56
+
+Compact summary (one row per config)
+------------------------------------------------------------------------------------------------
+  Config    Pass    Dur us   Reg   Occ %   Mem %  DRAM %    L2 %    Spill LD    Spill ST
+  neutral   OFF  888864.00    72   85.2%   81.7%   81.7%   29.1%           0           0
+  neutral   ON   890400.00    72   85.9%   81.7%   81.7%   29.1%           0           0
+  mid       OFF  947584.00   168   36.6%   81.2%   81.2%   26.8%           0           0
+  mid       ON   945920.00   168   37.1%   80.8%   80.8%   26.6%           0           0
+  win       OFF    6120.42    64   49.0%   64.7%   64.7%   23.3%        8.8M        8.1M
+  win       ON     5812.83    64   48.9%   64.0%   64.0%   23.1%        8.2M        7.6M
+  big       OFF    4909.82    64   12.5%   73.1%   73.1%   29.5%        8.6M        7.5M
+  big       ON     4936.86    64   12.4%   75.6%   75.6%   29.9%        8.8M        7.6M
+
+Analysis
+------------------------------------------------------------------------------------------------
+  [NEUTRAL] (BLOCK_M, BLOCK_N) = (64, 64)  tile = 4096
+    speedup (OFF/ON)        : 1.00x
+    regs/thread             : OFF=72  ON=72
+    occupancy               : OFF=85.2%  ON=85.9%
+    spill traffic (LD+ST)   : OFF=             0  ON=             0
+    -> negligible spill traffic in either version
+
+  [MID] (BLOCK_M, BLOCK_N) = (128, 128)  tile = 16384
+    speedup (OFF/ON)        : 1.00x
+    regs/thread             : OFF=168  ON=168
+    occupancy               : OFF=36.6%  ON=37.1%
+    spill traffic (LD+ST)   : OFF=             0  ON=             0
+    -> negligible spill traffic in either version
+
+  [WIN] (BLOCK_M, BLOCK_N) = (128, 256)  tile = 32768
+    speedup (OFF/ON)        : 1.05x
+    regs/thread             : OFF=64  ON=64
+    occupancy               : OFF=49.0%  ON=48.9%
+    spill traffic (LD+ST)   : OFF=    16,941,056  ON=    15,826,944
+    -> both versions spill heavily
+
+  [BIG] (BLOCK_M, BLOCK_N) = (256, 256)  tile = 65536
+    speedup (OFF/ON)        : 0.99x
+    regs/thread             : OFF=64  ON=64
+    occupancy               : OFF=12.5%  ON=12.4%
+    spill traffic (LD+ST)   : OFF=    16,130,048  ON=    16,379,904
+    -> both versions spill heavily
+
+================================================================================================

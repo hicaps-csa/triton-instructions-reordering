@@ -1,0 +1,72 @@
+================================================================================================
+  Triton 2-D join_quant_2d_kernel @ 16384^2 -- nsys timing sweep
+  Pass under test: DowncastReorderOptimizer (push fp32->i8 truncation before tt.join)
+================================================================================================
+
+Setup
+------------------------------------------------------------------------------------------------
+  GPU         : RTX 2080 Ti (68 SMs, 11 GiB)
+  Stack       : Triton 3.6.0 / nsys 2023.2.3 / torch 2.9.1+cu128
+  Iterations  : 50 between cudaProfilerStart/Stop, +3 warmup
+                (halved vs 8192 sweep -- each launch is ~4x heavier)
+  Reported    : per-launch avg from `nsys cuda_gpu_kern_sum`
+  Block sizes : (BLOCK_M, BLOCK_N) in {64, 128, 256}^2 -- 9 distinct kernels
+  Bytes/launch: 4*M*N (read a) + 4*M*N (read b) + 1*M*2*N (write i8) = 10*M*N
+              = 2.5 GiB at M = N = 16384
+
+=== Matrix size: 16384 x 16384  (268,435,456 elements/matrix) ===
+
+  Pass OFF -- avg per-launch time (us)
+           n=   64 n=  128 n=  256
+   m=  64    5527.2    4971.7    4899.1
+   m= 128    5517.6    4892.7    4905.3
+   m= 256    5558.3    4935.1   32240.7
+
+  Pass ON  -- avg per-launch time (us)
+           n=   64 n=  128 n=  256
+   m=  64    5529.8    4970.9    4900.1
+   m= 128    5509.5    4895.5    4888.5
+   m= 256    5546.7    4951.5   28859.8
+
+  Speedup (OFF/ON)  -- >1.00x means pass is faster
+           n=   64 n=  128 n=  256
+   m=  64     1.00x     1.00x     1.00x
+   m= 128     1.00x     1.00x     1.00x
+   m= 256     1.00x     1.00x     1.12x
+
+  Pass ON  -- effective bandwidth (GB/s, 10*M*N bytes/launch)
+           n=   64 n=  128 n=  256
+   m=  64     485.4     540.0     547.8
+   m= 128     487.2     548.3     549.1
+   m= 256     484.0     542.1      93.0
+
+  Detailed per-tile table
+       (m,n) |    tile |           grid |     OFF us |      ON us |  speedup | BW ON GB/s
+  -----------------------------------------------------------------------------------------------
+       64x64 |    4096 |  256x256=65536 |    5527.18 |    5529.76 |    1.00x |      485.4
+      64x128 |    8192 |  256x128=32768 |    4971.65 |    4970.90 |    1.00x |      540.0
+      64x256 |   16384 |   256x64=16384 |    4899.12 |    4900.14 |    1.00x |      547.8
+      128x64 |    8192 |  128x256=32768 |    5517.58 |    5509.52 |    1.00x |      487.2
+     128x128 |   16384 |  128x128=16384 |    4892.70 |    4895.46 |    1.00x |      548.3
+     128x256 |   32768 |    128x64=8192 |    4905.32 |    4888.48 |    1.00x |      549.1
+      256x64 |   16384 |   64x256=16384 |    5558.30 |    5546.73 |    1.00x |      484.0
+     256x128 |   32768 |    64x128=8192 |    4935.09 |    4951.50 |    1.00x |      542.1
+     256x256 |   65536 |     64x64=4096 |   32240.70 |   28859.79 |    1.12x |       93.0
+
+Findings
+------------------------------------------------------------------------------------------------
+  - Best speedup     : M=N=16384  (256, 256)  -> 1.12x  (32240.7us -> 28859.8us)
+  - Worst (regression): M=N=16384  (256, 128)  -> 1.00x  (4935.1us -> 4951.5us)
+
+  - Wins (>=1.10x)        : 1 configs
+  - Neutral (0.95-1.10x)  : 8 configs
+  - Regressions (<=0.95x) : 0 configs
+
+Comparison vs 8192^2 results (from nsys_results_2d.txt)
+------------------------------------------------------------------------------------------------
+  At 8192^2, the only meaningful win was at (256, 256): 1.11x
+  All other tile shapes were essentially flat between OFF and ON.
+  16384^2 quadruples the launch work; relative speedups can change
+  if a tile that was below the spill cliff at 8192 crosses it at 16384.
+
+================================================================================================

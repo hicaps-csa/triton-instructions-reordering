@@ -1,0 +1,4 @@
+Pattern : 02_pattern_deep_chain
+Report  : Section 6.6 -- Pattern 2: Deep Mover Chain
+Source  : triton_kernels/deep_chain_2d/
+Files   : 19

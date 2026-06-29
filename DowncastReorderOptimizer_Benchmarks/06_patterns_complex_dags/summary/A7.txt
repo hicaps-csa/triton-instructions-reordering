@@ -1,0 +1,168 @@
+================================================================================
+  Experiment A7 -- Y-SHAPE UPSTREAM (CSE interaction)
+  DowncastReorderOptimizer DAG-topology gap test
+================================================================================
+
+Status   : COMPLETE.
+Date     : 2026-05-20
+Hardware : RTX 2080 Ti (68 SMs, ~64 KB unified L1/shared per SM)
+Compiler : Triton 3.6.0 with DowncastReorderOptimizer at
+           lib/Dialect/Triton/Transforms/DowncastReorderOptimizer.cpp
+
+
+--------------------------------------------------------------------------------
+1. WHAT A7 TESTS
+--------------------------------------------------------------------------------
+
+A7 is one of the seven DAG-topology gaps in future_experiments.txt.
+A SHARED fp32 source (the loaded tensor) feeds TWO independent
+mover -> truncf chains. The pass rewrites each chain independently,
+so the load result ends up with TWO redundant truncf consumers
+(identical operand, identical result type).
+
+The test: does downstream MLIR CSE catch the duplication? If yes,
+the pass and CSE compose cleanly. If no, A7 has a hidden cost.
+
+Kernel pattern:
+   load a (fp32)  <- shared SSA value with TWO users below
+       |
+       +-------+----------+
+       |                  |
+    trans (2D)        reshape (2D->1D)         <- two different movers
+       |                  |
+    truncf-fp16        truncf-fp16
+       |                  |
+    trans (back)       reshape (->2D)
+       |                  |
+    store fp16         store fp16
+
+After pass (BEFORE downstream CSE):
+   load a (fp32)
+       |
+       +-------+----------+
+       |                  |
+    truncf-fp16        truncf-fp16        <- redundant! two identical truncfs
+       |                  |
+    trans (cancels        reshape
+    with downstream
+    trans)
+       |                  |
+    store fp16         store fp16
+
+
+--------------------------------------------------------------------------------
+2. STRUCTURAL PROOF (TTIR -> TTGIR via CSE)
+--------------------------------------------------------------------------------
+
+OFF TTIR:
+  %a_20 = tt.load ... : fp32                    -- shared SSA
+  %a_t  = tt.trans %a_20  : fp32                -- branch 1: mover
+  %d1   = arith.truncf %a_t   : fp16            -- branch 1: truncf
+  %out1 = tt.trans %d1                          -- branch 1: trans back
+  %a_r  = tt.reshape %a_20  : 16384xf32         -- branch 2: mover
+  %d2   = arith.truncf %a_r   : 16384xf16       -- branch 2: truncf
+  %out2 = tt.reshape %d2                        -- branch 2: reshape back
+  -- TWO truncf ops, different operands (a_t vs a_r)
+
+ON TTIR (post-pass + canonicalize):
+  %d1    = arith.truncf %a_20 : fp16            -- ONE truncf (cloned + canonicalized)
+  %a_r   = tt.reshape %d1     : 16384xf16
+  %out2  = tt.reshape %a_r    : 128x128 fp16
+  (branch 1's trans-trans collapsed by canonicalize; both stores
+   consume %d1)
+
+TTGIR confirmation:
+  OFF TTGIR : 2 arith.truncf ops
+  ON  TTGIR : 1 arith.truncf op
+  -> Downstream CSE catches the redundant truncfs introduced by the pass.
+
+LLIR confirmation:
+  OFF LLIR : 64 fptrunc machine ops
+  ON  LLIR : 64 fptrunc machine ops
+  -> Same total per-thread conversion count.
+
+SASS confirmation (BLOCK=128x128, M=N=4096):
+  metric           OFF      ON
+  F2F (fp->fp)     128      128       -- identical
+  LDL (spill ld)   0        0
+  STL (spill st)   0        0
+  PRMT             64       64
+  BAR              0        0
+
+Identical SASS in both states. Zero added kernel work from the
+redundancy introduced by the pass; downstream CSE caught it
+exactly.
+
+
+--------------------------------------------------------------------------------
+3. BIT-EXACT VERIFICATION
+--------------------------------------------------------------------------------
+
+verify_all.sh ran A7 OFF and ON at (M, N, BM, BN) = (2048, 2048, 128, 128).
+Both outputs (out_trans, out_reshape) bit-identical across OFF/ON.
+SHA-256 matches.
+
+NB: both branches' outputs are identical because trans(trans(x)) = x
+for square tensors, and reshape(reshape(x)) = x; both chains
+compute truncf(a) and store it to different output tensors.
+
+
+--------------------------------------------------------------------------------
+4. PERFORMANCE (10 nsys configs) -- NEGATIVE CONTROL
+--------------------------------------------------------------------------------
+
+  M=N=8192:                            M=N=4096:
+    tile     OFF us  ON us   sp        tile     OFF us  ON us   sp
+    64x64    1450.2  1448.8  1.00x     64x64     358.4   358.9  1.00x
+    64x256   1112.4  1113.5  1.00x     64x256    282.3   282.8  1.00x
+    128x128  1105.7  1106.9  1.00x     128x128   279.7   278.9  1.00x
+    128x256  1070.2  1069.4  1.00x     128x256   272.3   272.1  1.00x
+    256x128  1098.0  1096.8  1.00x     256x128   274.2   274.1  1.00x
+
+  Summary: 0 wins / 10 neutral / 0 regressions. Identical SASS.
+
+
+--------------------------------------------------------------------------------
+5. NCU AT THE MID (128x128, 8192)
+--------------------------------------------------------------------------------
+
+  metric        OFF         ON
+  duration      1086us      1081us            (1.00x)
+  DRAM total    537 MB      537 MB            (no change)
+  spill         0           0                 (no change)
+  regs/thread   104         104               (no change)
+  occupancy     45.5%       46.0%             (no change)
+
+Perfect neutrality at the ncu single-launch granularity. Matches
+the SASS / TTGIR finding: the redundant truncf the pass produces is
+fully merged by CSE before SASS emission, so kernel work is
+identical OFF vs ON.
+
+
+--------------------------------------------------------------------------------
+6. WHAT A7 ADDS TO THE STORY
+--------------------------------------------------------------------------------
+
+  - First end-to-end test of the pass's CSE interaction on Y-shape
+    upstream patterns.
+  - Verifies that the pass's "produce redundant clones" behavior is
+    SAFE because downstream MLIR canonicalize/CSE de-duplicates them
+    EXACTLY at the TTGIR / LLIR / SASS level.
+  - No new code needed in DowncastReorderOptimizer. The pipeline composition is
+    well-behaved.
+  - Documents that PASS+CSE composition is value-preserving AND
+    work-preserving for Y-shape upstream patterns.
+
+
+--------------------------------------------------------------------------------
+7. ARTIFACTS
+--------------------------------------------------------------------------------
+
+  Kernel       : A2_to_A7/test_A7_yshape_2d.py
+  TTIR         : A2_to_A7/A7_yshape_{OFF,ON}.ttir
+  TTGIR        : A2_to_A7/A7_yshape_{OFF,ON}.ttgir
+  LLIR         : A2_to_A7/A7_yshape_{OFF,ON}.llir
+  Verify log   : A2_to_A7/verify.log (A7 section)
+  Perf data    : A2_to_A7/nsys_results.csv  (rows with tag=A7)
+  ncu data     : /tmp/ncu_runs_A2A7/A7_*.csv
+  SASS dumps   : /tmp/sass_A7_{off,on}.sass

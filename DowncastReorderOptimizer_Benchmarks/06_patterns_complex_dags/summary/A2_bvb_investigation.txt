@@ -1,0 +1,258 @@
+================================================================================
+  Why does A2 show a ~15-20% best-vs-best (B-v-B) speedup?
+  Investigation: nsys + ncu + SASS comparison across A2/A3/A4/A5 at the
+  best ON tile (64x256 @ M=N=8192).
+================================================================================
+
+Date     : 2026-06-18
+Hardware : RTX 2080 Ti (sm_75)
+Pass     : DowncastReorderOptimizer with register-pressure gate (see memory:
+           register-pressure-gate.md)
+
+
+--------------------------------------------------------------------------------
+0. KEY TOGGLE CORRECTION
+--------------------------------------------------------------------------------
+
+The pass is now toggled via the env var TRITON_DISABLE_DOWNCAST_REORDER_OPTIMIZER:
+  OFF = TRITON_DISABLE_DOWNCAST_REORDER_OPTIMIZER=1
+  ON  = no var (or =0)
+The old sed approach (commenting out compiler.py line 243) no longer works:
+the pass call moved into a wrapper at line 248 with 12-space indent. Initial
+runs in this investigation produced misleading "OFF==ON" results because the
+toggle wasn't taking effect; all subsequent measurements use the env var.
+
+
+--------------------------------------------------------------------------------
+1. B-v-B SUMMARY (nsys @ M=N=8192, all measured tiles)
+--------------------------------------------------------------------------------
+
+For each kernel, B-v-B = min(OFF per-tile time) / min(ON per-tile time).
+
+  Kernel  best OFF tile / time     best ON tile / time     B-v-B
+  ----------------------------------------------------------------
+  A2      64x256 / 2358.9 us       64x256 / 2045.6 us      1.153x
+  A3      64x256 / 1845.8 us       64x256 / 1481.8 us      1.246x
+  A4      64x256 / 2367.6 us       64x256 / 2040.5 us      1.160x
+  A5      64x64  / 3514.7 us       64x256 / 3291.4 us      1.068x   *
+  A6      64x256 / 1251.0 us       64x256 / 1251.0 us      1.000x
+  A7     128x256 / 1070.2 us      128x256 / 1069.4 us      1.001x
+
+  * A5: OFF best tile moves to 64x64 (the only small enough tile to escape
+    A5's heavy spill regime). ON's 64x256 is the rescued tile.
+
+The user said "A2 is only kernel with significant B-v-B" -- strictly A3 has
+1.25x and A4 has 1.16x. A4 is structurally identical to A2 (same end state
+after pass+canonicalize). The cluster {A2, A3, A4} all share the same B-v-B
+mechanism, with A3 slightly higher due to deeper narrowing (i8 vs fp16).
+
+
+--------------------------------------------------------------------------------
+2. PER-LAUNCH TIMING (CUDA events, 100 iters + 10 warmup, M=N=8192)
+--------------------------------------------------------------------------------
+
+Confirming the B-v-B speedups are real per-launch behavior, not artifacts of
+nsys' averaging.
+
+At the best ON tile (64x256):
+              OFF (us)    ON (us)    speedup
+    A2        2364.0      2041.8     1.158x
+    A3        1855.9      1523.1     1.219x
+    A4        2371.5      2070.2     1.146x
+    A5       18773.3      3338.2     5.624x   <- huge per-tile rescue
+
+At A2's "peak rescue" tile (128x128):
+    A2        2634.4      2214.5     1.190x
+    A3        2229.2      1805.7     1.234x
+    A4        2651.4      2192.3     1.209x
+    A5       18233.7      3317.0     5.498x
+
+A2's per-launch speedup IS real (1.16-1.19x). The B-v-B speedup is identical
+to the per-tile speedup because OFF cannot escape to a smaller equally-fast
+tile.
+
+
+--------------------------------------------------------------------------------
+3. SASS OPCODE COMPARISON AT 64x256 (the best ON tile)
+--------------------------------------------------------------------------------
+
+Key opcode counts from cuobjdump --dump-sass:
+
+  kernel mode  LDG  STG  LDL  STL  STS  LDSM PRMT F2F  F2I  BAR
+  ------------------------------------------------------------------
+  A2     OFF   64   64   24   24   64   64   130  256  0    127
+  A2     ON    64   64    0    0   32   32   258  256  0     63
+  A3     OFF   64   32   41   38   64   64   386  0    512  127
+  A3     ON    64   32    0    0   32   32   770  0    512   63
+  A4     OFF   64   64   24   24   64   64   130  256  0    127
+  A4     ON    64   64    0    0   32   32   258  256  0     63
+  A5     OFF  128   64  1556 1208 128  128   259  512  0    255
+  A5     ON   128   64   41   40   64   64   515  512  0    127
+
+The pass's mechanism is IDENTICAL on A2/A3/A4 -- the canonical narrowed-cat
+rewrite signature:
+
+  -- ALGORITHMIC INVARIANTS PRESERVED --
+  LDG (global loads)         : unchanged  (input reads)
+  STG (global stores)        : unchanged  (output writes)
+  F2F / F2I (truncation ops) : unchanged  (same number of casts)
+
+  -- SPILL ELIMINATED --
+  LDL (local-mem loads)      : 24->0 (A2/A4), 41->0 (A3)
+  STL (local-mem stores)     : 24->0 (A2/A4), 38->0 (A3)
+
+  -- SHARED-MEM STAGING HALVED --
+  LDSM (shared-mem matrix)   : 64->32   (halved)
+  STS  (shared-mem stores)   : 64->32   (halved)
+  BAR  (synchronizations)    : 127->63  (halved)
+
+  -- IN-REGISTER PERMUTE DOUBLES (replaces shmem staging) --
+  PRMT                       : 130->258 (A2/A4 doubled)
+                               386->770 (A3 doubled)
+
+A4 SASS is BYTE-IDENTICAL to A2 SASS at 64x256 (and at 128x128). The
+multi-level diamond collapses, via canonicalize, to the same end-state cubin
+as the direct cache-hit kernel. This is empirical proof of the structural
+identity claim made in the A1-A7 writeup.
+
+A3 differs from A2 in the headline workload (i8 stores vs two fp16 stores)
+but the pass's effect is the same shape: spill killed, shmem halved, BAR
+halved, PRMT doubled.
+
+A5 is in a different regime: 30-40x more spill at OFF (1556 LDL vs A2's 24).
+ON eliminates 97% of the spill (1556->41). The headline 5.6x speedup is
+because A5 starts in heavy-spill territory; A2/A3/A4 start in MILD-spill
+territory and the speedup is correspondingly modest.
+
+
+--------------------------------------------------------------------------------
+4. WHY A2 GETS THE B-v-B SPEEDUP -- THE GOLDILOCKS REGIME
+--------------------------------------------------------------------------------
+
+The B-v-B speedup is the same-tile speedup IF AND ONLY IF OFF cannot escape
+to a smaller equally-fast tile. Four conditions must align for a meaningful
+B-v-B:
+
+  (1) OFF's best tile has some real, measurable inefficiency (spill or shmem
+      staging) that the pass can attack. A2 OFF at 64x256: 24 LDL/STL spill
+      + 127 BAR + 64 LDSM + 64 STS. Not zero.
+
+  (2) The pass's narrowing (cat fp32 -> fp16) is enough to eliminate that
+      inefficiency at this tile. A2 ON: 0 spill, 63 BAR, 32 LDSM, 32 STS.
+      Exactly halved.
+
+  (3) The OFF kernel has no smaller tile that is faster, so OFF cannot
+      escape via tile choice. A2 OFF: 64x64=2899, 64x128=2705, 64x256=2359
+      -- 64x256 is OFF's best.
+
+  (4) The pass actually fires at this tile -- the register-pressure gate
+      does NOT bail. (At heavy-regression tiles the gate now refuses; A2's
+      64x256 estimates <256 regs so the gate allows.)
+
+For A2, all four hold. The result is a 1.16x same-tile speedup that
+translates directly to 1.16x B-v-B.
+
+CONTRAST WITH THE OTHER A-EXPERIMENTS:
+
+  A4: identical end state to A2 -> same 1.15x B-v-B (same SASS).
+
+  A3: same mechanism as A2, but with deeper narrowing (4x to i8 vs 2x to
+      fp16). The cat intermediate goes from fp32 to i8 -- 4x shrinking
+      instead of 2x. Slightly higher B-v-B (1.25x) because the spill regime
+      at 64x256 is fully eliminated AND the narrowed-cat working set is
+      smaller, freeing more register headroom that lets the compiler
+      generate slightly tighter code.
+
+  A5: 5.6x per-tile rescue at 64x256 -- much bigger than A2 -- BUT A5 OFF
+      can escape to 64x64 (which is small enough not to spill), so OFF's
+      best tile becomes 64x64 (3514 us) and B-v-B = 3514/3291 = 1.07x. The
+      huge per-tile rescue does NOT translate to a workload speedup because
+      OFF has an escape hatch.
+
+  A1 (Exp 5 multi-consumer 3-way in Final_Report): same escape-hatch story
+      as A5 -- OFF moves from 64x256 (which spills heavily under fp32 3-way
+      diamond) to 64x128 (which fits). B-v-B = 1.06x. Per-tile rescue
+      1.58x.
+
+  A6: pass is a verified no-op (bitwidth guard correctly skips). 1.00x.
+
+  A7: pass produces redundant clones that downstream CSE merges. Byte-
+      identical SASS OFF/ON. 1.00x.
+
+  Exp 1, 2, 4 in Final_Report (linear chains): similar to A5/A1 -- big
+      per-tile rescue (up to 8.04x in Exp 2) but B-v-B only 1.01-1.04x
+      because OFF can pick a small tile that fits in registers.
+
+
+--------------------------------------------------------------------------------
+5. THE CORE INSIGHT
+--------------------------------------------------------------------------------
+
+A2's "20% B-v-B speedup" is the cleanest demonstration of DowncastReorderOptimizer's
+structural benefit at the WORKLOAD level (best-to-best, not best-to-worst).
+The mechanism, exactly:
+
+  At A2's best OFF tile (64x256, M=N=8192):
+    cat lowered as: shared-mem staged + register spill (24 LDL/STL).
+  At A2's best ON tile (same 64x256):
+    cat lowered as: register/permute staged, NO spill, half the BAR/LDSM/STS.
+
+The pass converts an fp32 cat (wider intermediate, marginally too big for
+255 registers) into an fp16 cat (narrower, fits comfortably). At this
+specific tile shape, the conversion is structurally relevant -- not
+zero-effect like at 64x64, and not catastrophic-rescue like at large spill
+tiles. The 1.16x is the steady-state speedup of the new staging.
+
+The reason A2's B-v-B "stands out" (in the sense the user noted) is that
+A2 is a kernel where:
+  - the pass has a real effect at OFF's best tile (not zero), AND
+  - OFF has no escape to a smaller equally-fast tile.
+
+A4 has the same property and the same numbers (and the same SASS). A3 has
+the same property with higher magnitude (i8 narrowing). A5 has a much
+bigger per-tile rescue but loses it to an escape tile, so B-v-B is small.
+Experiments 1, 2 (Final_Report) have huge per-tile rescues that all get
+absorbed by escape tiles.
+
+The B-v-B reflects two things at once: (a) does the pass work at OFF's
+best tile, and (b) does OFF have a tile-choice escape. A2 is the canonical
+example where both answers favor a measurable workload gain.
+
+
+--------------------------------------------------------------------------------
+6. ARTIFACTS PRODUCED
+--------------------------------------------------------------------------------
+
+  /tmp/sass_envvar/
+    A{2,3,4,5}_{OFF,ON}_64x256.sass   -- cuobjdump SASS dumps
+    A2_{OFF,ON}_128x128.sass          -- A2 at peak-rescue tile
+    *.opcodes                         -- opcode histograms
+
+  /tmp/time_a2_modes.py               -- CUDA-event timing script
+  /tmp/redo_ncu_envvar.sh             -- ncu via env-var toggle (sudo issue;
+                                         ncu not used in the end, CUDA-event
+                                         timing was sufficient)
+  /tmp/sass_envvar.sh                 -- SASS dump script with env-var toggle
+
+
+--------------------------------------------------------------------------------
+7. ONE-PARAGRAPH ANSWER
+--------------------------------------------------------------------------------
+
+A2's ~15-20% best-vs-best speedup at the (64,256) tile @ M=N=8192 is the
+canonical demonstration of DowncastReorderOptimizer's cache-HIT mechanism. The pass
+narrows the fp32 cat intermediate to fp16, which at this tile eliminates a
+modest spill regime (24 LDL/STL ops/thread -> 0), halves the shared-mem
+staging traffic (LDSM/STS 64->32, BAR 127->63), and doubles in-register
+PRMT operations -- LDG/STG/F2F unchanged, so the algorithm is preserved.
+The per-launch CUDA-event timing confirms the same 1.16x speedup (OFF 2364
+us, ON 2042 us). What makes this number show up as a workload-level B-v-B
+(not just a per-tile rescue absorbed by tile choice) is that A2 OFF's best
+tile is ALREADY 64x256 -- there is no smaller tile that OFF can escape
+to. A4 is byte-identical at the SASS level (same end state via multi-level
+canonicalize) and gives the same 1.16x; A3 uses i8 narrowing (4x) and
+gives 1.22x at the same tile; A5 has a much larger per-tile rescue (5.6x)
+but B-v-B is only 1.07x because A5 OFF escapes to 64x64. The pass is
+mechanically identical across A2/A3/A4; what differs is the magnitude of
+the OFF inefficiency it can attack and whether OFF has a tile-choice
+escape hatch.

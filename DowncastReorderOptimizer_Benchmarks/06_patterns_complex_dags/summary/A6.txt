@@ -1,0 +1,150 @@
+================================================================================
+  Experiment A6 -- PER-OPERAND BITWIDTH GUARD
+  DowncastReorderOptimizer DAG-topology gap test
+================================================================================
+
+Status   : COMPLETE.
+Date     : 2026-05-20
+Hardware : RTX 2080 Ti (68 SMs, ~64 KB unified L1/shared per SM)
+Compiler : Triton 3.6.0 with DowncastReorderOptimizer at
+           lib/Dialect/Triton/Transforms/DowncastReorderOptimizer.cpp
+
+
+--------------------------------------------------------------------------------
+1. WHAT A6 TESTS
+--------------------------------------------------------------------------------
+
+A6 is one of the seven DAG-topology gaps in future_experiments.txt.
+It tests the per-operand bitwidth guard in eligibleReducers
+(DowncastReorderOptimizer.cpp lines 356-372), which skips the consumer when ANY
+producer operand's element-type bitwidth is NOT STRICTLY GREATER than
+the consumer's destination bitwidth:
+
+    elemTy.getIntOrFloatBitWidth() <= dstType.getElementTypeBitWidth()
+        -> allOperandsReduce = false; break;
+
+A6 as originally framed (cat of mixed-bitwidth operands) cannot be
+expressed in Triton because all cat operands must share a dtype.
+Instead we test the same guard via a single-operand mover (reshape)
+with an operand whose bitwidth EQUALS the destination -- the boundary
+case `width <= dst_width`.
+
+
+--------------------------------------------------------------------------------
+2. TWO PATHS IN ONE KERNEL
+--------------------------------------------------------------------------------
+
+Path A (guard FAILS):
+  load fp16 -> reshape (mover, 16-bit) -> fptosi -> i16 (16-bit)
+  Operand bitwidth 16 == dest 16. Strictly-greater check FAILS.
+  -> Pass SHOULD NOT rewrite. Expect ON IR identical to OFF IR for
+     this chain.
+
+Path B (guard PASSES, control case):
+  load fp32 -> reshape (mover, 32-bit) -> fptosi -> i16 (16-bit)
+  Operand bitwidth 32 > 16. Guard PASSES.
+  -> Pass SHOULD rewrite. Expect ON IR with fptosi pushed above
+     reshape on this chain.
+
+Both paths run in the same kernel and produce i16 stores. The TTIR
+diff between OFF and ON should show ONE rewrite (Path B), not two.
+
+
+--------------------------------------------------------------------------------
+3. STRUCTURAL PROOF (TTIR)
+--------------------------------------------------------------------------------
+
+OFF TTIR (both paths):
+  Path A:  %a16_flat = tt.reshape %a16 : f16 -> f16
+           %pa = arith.fptosi %a16_flat to i16
+  Path B:  %a32_flat = tt.reshape %a32 : f32 -> f32
+           %pb = arith.fptosi %a32_flat to i16
+
+ON TTIR:
+  Path A:  %a16_flat = tt.reshape %a16 : f16 -> f16    -- UNCHANGED
+           %pa = arith.fptosi %a16_flat to i16          -- guard correctly fails
+
+  Path B:  %pb = arith.fptosi %a32 to 128x128xi16       -- REWRITTEN
+           %a32_flat = tt.reshape %pb : 128x128xi16 -> 16384xi16
+                                                       -- fptosi pushed ABOVE reshape
+
+The two paths in the SAME kernel give a single-shot proof that the
+guard fires SELECTIVELY: same-bitwidth operands skipped, strictly-
+greater operands rewritten.
+
+
+--------------------------------------------------------------------------------
+4. BIT-EXACT VERIFICATION
+--------------------------------------------------------------------------------
+
+verify_all.sh ran A6 OFF and ON at (M, N, BM, BN) = (2048, 2048, 128, 128).
+Both outputs (pathA, pathB) bit-identical across OFF/ON. SHA-256 match.
+
+
+--------------------------------------------------------------------------------
+5. PERFORMANCE (10 nsys configs) -- NEGATIVE CONTROL
+--------------------------------------------------------------------------------
+
+  M=N=8192:                            M=N=4096:
+    tile     OFF us  ON us   sp        tile     OFF us  ON us   sp
+    64x64    1611.1  1613.1  1.00x     64x64     385.4   386.1  1.00x
+    64x256   1251.0  1251.0  1.00x     64x256    315.9   315.9  1.00x
+    128x128  1307.5  1307.1  1.00x     128x128   327.7   328.3  1.00x
+    128x256  4288.1  4283.4  1.00x     128x256  1025.3  1025.9  1.00x
+    256x128  3820.1  3819.5  1.00x     256x128   921.1   921.7  1.00x
+
+  Summary: 0 wins / 10 neutral / 0 regressions.
+
+10 out of 10 configs PERFECTLY NEUTRAL (within 0.5%).
+
+
+--------------------------------------------------------------------------------
+6. NCU AT THE MID (128x128, 8192)
+--------------------------------------------------------------------------------
+
+  metric        OFF         ON
+  duration      1326us      1304us            (0.98x, sub-2%)
+  DRAM total    683 MB      683 MB            (no change)
+  spill         0           0                 (no change)
+  regs/thread   217         217               (no change)
+  occupancy     24.3%       23.9%             (no change)
+
+SASS check (128x128, 4096):
+  F2I=256 in both states  (algorithm preserved)
+  LDG=48  in both states  (global loads identical)
+  LDL=0, STL=0 in both    (no spill)
+
+The pass's rewrite on path B is irrelevant for perf because the
+inner reshape is a no-op view at this tile, and the SASS-level F2I
+count is exactly preserved either way. Path A is correctly skipped
+by the guard.
+
+
+--------------------------------------------------------------------------------
+7. WHAT A6 ADDS TO THE STORY
+--------------------------------------------------------------------------------
+
+  - First test of the per-operand bitwidth guard's SKIP behavior.
+  - "Negative-control" experiment: demonstrates that the pass is a
+    perf no-op when the guard correctly skips a non-eligible
+    consumer.
+  - Two paths in one kernel give simultaneous proof that the guard
+    fires selectively at the consumer level, not at the producer
+    level.
+  - The original A6 spec (cat of mixed-bitwidth operands) cannot be
+    expressed in Triton because cat operands must share a dtype.
+    Reframed to use single-operand movers (reshape) with same-vs-
+    greater bitwidth.
+
+
+--------------------------------------------------------------------------------
+8. ARTIFACTS
+--------------------------------------------------------------------------------
+
+  Kernel       : A2_to_A7/test_A6_bitwidth_guard_2d.py
+  TTIR         : A2_to_A7/A6_bitwidth_guard_{OFF,ON}.ttir
+  TTGIR        : A2_to_A7/A6_bitwidth_guard_{OFF,ON}.ttgir
+  Verify log   : A2_to_A7/verify.log (A6 section)
+  Perf data    : A2_to_A7/nsys_results.csv  (rows with tag=A6)
+  ncu data     : /tmp/ncu_runs_A2A7/A6_*.csv
+  SASS dumps   : /tmp/sass_A6_{off,on}.sass

@@ -1,0 +1,4 @@
+Pattern : 11_appendix_multi_consumer_trans
+Report  : Section A.3 -- Multi-consumer trans
+Source  : triton_kernels/multi_consumer_trans_trunc_2d/
+Files   : 17

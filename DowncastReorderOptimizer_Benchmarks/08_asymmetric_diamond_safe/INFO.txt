@@ -1,0 +1,4 @@
+Pattern : 08_asymmetric_diamond_safe
+Report  : Section 6.10.6 -- Asymmetric Diamond (safe control)
+Source  : triton_kernels/asymmetric_diamond_trans_safe_2d/
+Files   : 19

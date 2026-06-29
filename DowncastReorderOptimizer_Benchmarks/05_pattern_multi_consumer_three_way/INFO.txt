@@ -1,0 +1,4 @@
+Pattern : 05_pattern_multi_consumer_three_way
+Report  : Section 6.9 -- Pattern 5: Multi-consumer (three-way)
+Source  : triton_kernels/multi_consumer_cat_3kind_2d/
+Files   : 17

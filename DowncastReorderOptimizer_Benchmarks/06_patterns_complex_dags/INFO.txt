@@ -1,0 +1,12 @@
+Pattern : 06_patterns_complex_dags
+Report  : Section 6.10 -- Patterns 6-11: Complex DAGs (cache hit, mixed-kind, multi-level, cat-of-cats, bit-width guard, Y-shape)
+Source  : triton_kernels/A2_to_A7/
+Files   : 61
+
+Inside this folder:
+  Pattern 6  : kernels/test_A2_cachehit_2d.py        cache hit (same-kind same-type)
+  Pattern 7  : kernels/test_A3_mixedkind_2d.py       cache split (mixed-kind)
+  Pattern 8  : kernels/test_A4_multilevel_2d.py      multi-level diamond
+  Pattern 9  : kernels/test_A5_catofcats_2d.py       nested concatenations
+  Pattern 10 : kernels/test_A6_bitwidth_guard_2d.py  bit-width guard (no-op)
+  Pattern 11 : kernels/test_A7_yshape_2d.py          Y-shape (CSE interaction)

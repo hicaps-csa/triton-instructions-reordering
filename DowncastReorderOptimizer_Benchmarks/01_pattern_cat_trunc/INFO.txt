@@ -1,0 +1,4 @@
+Pattern : 01_pattern_cat_trunc
+Report  : Section 6.5 -- Pattern 1: Concatenate -- Truncate
+Source  : triton_kernels/cat_trunc_2d/
+Files   : 12

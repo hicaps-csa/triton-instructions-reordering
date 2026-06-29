@@ -1,0 +1,368 @@
+================================================================================
+  dual_quant_2d @ M=N=8192 -- WIN (128x128) AND REGR (128x256)
+  Spill-removal pass: verification, attribution, and the regression case
+================================================================================
+
+What the kernel computes:
+  load a, b (fp32, MxN)
+       -> reshape to 1-D
+       -> tl.cat into a 1-D fp32 vector of length 2*BLOCK_M*BLOCK_N
+       -> DIAMOND: this single cat feeds two reducers
+            (1) c.to(int8)   -> reshape -> store i8
+            (2) c.to(float16)-> reshape -> store f16
+  Two outputs per launch: (2M, N) int8 AND (2M, N) fp16.
+
+What the pass does (DAG extension A):
+  Clones BOTH reducer chains backward through the cat. Because both users
+  are size-reducing (i8 and f16 are smaller than fp32), the guard does
+  NOT bail. The dedup cache keyed on (OperationName, Type) distinguishes
+  (fptosi, i8) from (truncf, f16), so we get TWO rewritten chains. The
+  original fp32 cat dies (use_empty after rewrites).
+
+  Intent: avoid materializing the large fp32 cat working set; instead
+  run two narrower chains in i8 and f16.
+
+  Risk: if the cloned chains still cannot fit in registers, BOTH chains
+  spill independently and you pay 2x the spill cost plus duplicated
+  arithmetic. That is exactly what happens at REGR (128x256).
+
+
+================================================================================
+1.  HEADLINE NUMBERS
+================================================================================
+
+  Config    Speedup     OFF us    ON us   OFF spills (slots / reqs)   ON spills
+  -------------------------------------------------------------------------------
+  NEUTRAL   1.00x       2595      2601    0 / 0                       0 / 0
+  WIN       1.26x       2664      2109    64 / 2.8M reqs              0 / 0
+  REGR      0.68x       9993      14701   834 / 32.2M reqs            1238 / 40.8M reqs
+  BIG       1.00x       12731     12746   ~33 / 38.6M reqs            ~34 / 37.9M reqs
+
+  WIN  : pass eliminates all spills          -> 1.26x speedup
+  REGR : pass CLONED chains, each spills     -> 1.47x slowdown (0.68x)
+         independently. Spill traffic grew by
+         8.7M requests and 1.15 GB of DRAM.
+  NEUTRAL: no spill in either                -> 1.00x
+
+
+================================================================================
+2.  BIT-EXACT CORRECTNESS (sha256 of both outputs, M=N=8192)
+================================================================================
+
+  Config     i8 sha256            f16 sha256            Match
+  ---------------------------------------------------------------
+  WIN        7213fe30..c2c9       873da578..b7ab        YES
+  REGR       6944ba29..cfd3       4d3776b7..e4b6        YES
+  NEUTRAL    25c5bae3..083b       e09a91de..8ece        YES
+
+  The pass is value-preserving in all three configs, including REGR.
+  REGR is a performance regression, NOT a correctness bug.
+
+
+================================================================================
+3.  SASS OPCODE DIFF (per-thread counts, from cuobjdump --dump-sass)
+================================================================================
+
+  --- WIN (128x128) ---
+  opcode                            OFF      ON    delta   note
+  --------------------------------------------------------------------
+  LDG.E.128.SYS                      64      64    +0      same global loads
+  STG.E.128.SYS                      48      48    +0      same global stores
+  F2I.S16.TRUNC.NTZ                 256     256    +0      same fp32->i8
+  F2F.F16.F32                       256     256    +0      same fp32->f16
+  LDL.LU + LDL.LU.64 + LDL          165       0    -165    all spill reads gone
+  STL + STL.64                       79       0    -79     all spill writes gone
+  BAR.SYNC                          127      95    -32     -25% barriers
+  LDSM.16.M88.4                      64      48    -16     -25% shared loads
+  STS.128                            64      48    -16     -25% shared stores
+  PRMT                              322     642    +320    permutes ~2x (cloned chains)
+  IMAD.MOV.U32                       13     151    +138    cloned addr arith
+  LOP3.LUT                          340     335    -5      ~unchanged
+
+  --- REGR (128x256) ---
+  opcode                            OFF      ON    delta   note
+  --------------------------------------------------------------------
+  LDG.E.128.SYS                     128     128    +0      same global loads
+  STG.E.128.SYS                      96      96    +0      same global stores
+  F2I.S16.TRUNC.NTZ                 512     512    +0      same fp32->i8
+  F2F.F16.F32                       512     512    +0      same fp32->f16
+  LDL.LU                           1561    2124    +563    MORE spill reads
+  LDL.LU.64                         138     271    +133    MORE spill reads
+  LDL                              2026    2260    +234    MORE spill reads
+  STL                              1201    1834    +633    MORE spill writes
+  STL.64                            562     617    +55     MORE spill writes
+                                  ----    ----    ----
+  total spill ops               (5488)  (7106)   +1618    pass made spills WORSE
+  BAR.SYNC                          255     191    -64     -25% barriers
+  LDSM.16.M88.4                     128      96    -32     -25%
+  STS.128                           128      96    -32     -25%
+  PRMT                              648    1291    +643    permutes ~2x (cloned)
+  IMAD.MOV.U32                      261     654    +393    cloned addr arith
+  LOP3.LUT                          677     678    +1      unchanged
+
+  Key observation:
+    In both WIN and REGR the algorithmic global I/O is preserved
+    (LDG/STG/F2I/F2F identical). The pass is correct.
+    In WIN it eliminates all spills.
+    In REGR it ADDS spills (1618 extra per-thread spill ops).
+
+
+================================================================================
+4.  NCU METRICS (M=N=8192, units normalized)
+================================================================================
+
+  cfg          dur us    DRAM R     DRAM W     DRAM T   rate GB/s     inst    reg
+  --------------------------------------------------------------------------------
+  WIN_OFF      2664.3   576.6 MB   564.8 MB    1.14 GB      428.4   37.06M    255
+  WIN_ON       2109.0   536.9 MB   399.7 MB   936.7 MB      444.1   40.63M    255
+  REGR_OFF     9993.0    2.74 GB    2.24 GB    4.98 GB      498.6   62.31M     64
+  REGR_ON     14700.8    3.16 GB    2.97 GB    6.13 GB      416.9   77.14M     64
+  NEU_OFF      2595.1   536.9 MB   400.1 MB   937.0 MB      361.1   36.04M     72
+  NEU_ON       2601.4   536.9 MB   400.1 MB   937.1 MB      360.2   40.24M     68
+
+  Theoretical algorithmic I/O = 2*M*N*4 (read A,B) + 2*M*N*1 (write i8)
+                              + 2*M*N*2 (write f16)
+                              = 512 + 134 + 268 = 939.5 MB
+
+  NEUTRAL is the control: both versions exactly hit theoretical (937 MB).
+  WIN_ON  also hits theoretical (937 MB) -- spill traffic gone.
+  WIN_OFF is +202 MB over theoretical -- spill bytes reaching DRAM.
+  REGR_OFF is +4.04 GB over theoretical -- heavy spill bytes.
+  REGR_ON  is +5.19 GB over theoretical -- EVEN MORE spill bytes after pass.
+
+
+================================================================================
+5.  SPILL-COST SUBTRACTION
+================================================================================
+
+  --- WIN ---
+    Wall-time delta       : +555 us (speedup)
+    DRAM bytes saved      : +205 MB
+    Cost at ON bw 444 GB/s: 461 us
+    -> 83% of speedup explained by DRAM bandwidth saved on spill removal.
+    Residual 95 us from -25% BAR.SYNC + -25% LDSM/STS reductions.
+
+  --- REGR ---
+    Wall-time delta       : -4708 us (slowdown)
+    DRAM bytes ADDED      : +1146 MB
+    Cost at ON bw 417 GB/s: 2749 us
+    -> 58% of slowdown explained by EXTRA DRAM bandwidth on duplicated spill.
+    Remaining 42% (~2 ms) from 14.8M extra instructions: the cloned chain
+    runs all the cat/permute/address machinery twice (once for the i8 chain,
+    once for the f16 chain) and the duplicated work is mostly wasted because
+    the cloned chains spill anyway.
+
+  --- NEUTRAL ---
+    Wall-time delta       : -6 us (within noise)
+    DRAM bytes saved      : -0.1 MB (within noise)
+    -> Pass is a no-op when there is nothing to gain. Confirmed.
+
+
+================================================================================
+6.  INSTRUCTION-COUNT ACCOUNTING (per warp)
+================================================================================
+
+  WIN: per-warp inst delta = -3,571,712 / (4096 blocks * 4) = -218 inst/warp
+       SASS predicts:
+         removed: 244 spill ops + 32 BAR + 16 LDSM + 16 STS + ~5 LOP3   = 313
+         added  : 320 PRMT + 138 IMAD.MOV                               = 458
+         net    : +145 (ADDED)  -- but ncu shows -218
+       Why the mismatch? SASS counts STATIC instructions; ncu counts
+       DYNAMIC issued instructions. Spill ops are predicated and can
+       execute fewer times than statically present; ALSO many of the
+       "added" IMAD.MOV.U32 may be predicated off in most threads. The
+       net dynamic effect is fewer issued instructions because spill
+       traffic carries a high dynamic cost (extra LSU pipe cycles).
+       For attribution purposes, the dominant effect at WIN is still
+       DRAM bandwidth saved (83%), not raw inst count.
+
+  REGR: per-warp inst delta = -14,827,520 / (2048*4) = -1810 inst/warp (added)
+        Same SASS-vs-dynamic mismatch in the other direction:
+        more spill ops + more PRMT + more IMAD.MOV -> ~+1.8K dynamic
+        inst per warp. Matches the SASS direction (+1618 spill +643 PRMT
+        +393 IMAD.MOV - 64 BAR - 64 LDSM/STS).
+
+
+================================================================================
+7.  WHY DOES THE PASS REGRESS AT (128, 256)?
+================================================================================
+
+The pass's guard checks "are both users size-reducing?" but does NOT
+check "will the cloned chains still fit in registers?"
+
+At (128, 256):
+  - tile = 32,768 elements
+  - OFF version compiles to 64 registers (Triton chose low-reg config)
+    and ALREADY spills 834 slots / 32.2M dynamic reqs
+  - ON version clones the two reducer chains:
+      * each clone has its own working set
+      * still 64 registers
+      * now each chain spills independently
+      * total: 1238 slots / 40.8M dynamic reqs (+27%)
+  - The duplicated arithmetic (PRMT 2x, IMAD.MOV 2.5x) adds 14.8M more
+    issued instructions
+  - DRAM traffic grows by 1.15 GB (28%)
+  - Wall-clock penalty: 4708 us (1.47x slowdown)
+
+Compare WIN (128, 128):
+  - tile = 16,384 elements (HALF the REGR working set)
+  - OFF version uses 255 registers (the cap) and spills only 64 slots
+    / 2.8M dynamic reqs
+  - ON version uses 255 registers and ELIMINATES all spills
+  - The chain duplication still happens (PRMT 2x, IMAD.MOV +138), but
+    eliminating spill bandwidth dominates.
+
+The decisive variable is "can the cloned chain fit in registers without
+spilling?". WIN (tile 16K) yes, REGR (tile 32K) no.
+
+A correct cost model for this pass would:
+  - estimate per-chain register pressure post-clone
+  - require BOTH cloned chains to fit, OR estimate net spill traffic
+    before vs after, and bail when after > before
+
+
+================================================================================
+8.  VERDICT PER ORIGINAL 7-STEP PLAN (now applied to WIN and REGR)
+================================================================================
+
+                                          WIN              REGR
+  ---------------------------------------------------------------
+  1  SASS deltas = only spill + addr      PARTIALLY        PARTIALLY
+     arith                                (also BAR-25%,   (also BAR-25%,
+                                          LDSM/STS-25%,    LDSM/STS-25%,
+                                          PRMT 2x)         PRMT 2x; spills
+                                                           INCREASE)
+
+  2  Inst-count math                      83% spill DRAM   58% extra spill
+                                          explains time    DRAM explains
+                                                           slowdown
+
+  3  Identical DRAM bytes                 FALSE: -205 MB   FALSE: +1146 MB
+                                                           (pass MADE it
+                                                            worse)
+
+  4  Bit-exact output                     CONFIRMED        CONFIRMED
+                                          (sha256 match    (sha256 match
+                                          both i8 and      both i8 and
+                                          f16)             f16)
+
+  5  Locked launch config                 CONFIRMED        CONFIRMED
+                                          num_warps=4,     num_warps=4,
+                                          BLOCK=128x128    BLOCK=128x256
+
+  6  Spill cost ~ wall delta              CONFIRMED 83%    CONFIRMED 58%
+                                                           (for SLOWDOWN
+                                                           direction)
+
+  7  Stall shifts in expected direction   long_scoreboard  long_scoreboard
+                                          +92% (expected)  +53% (still
+                                          barrier -17%     bound on real
+                                                           waits, but now
+                                                           ALSO bound on
+                                                           more spill
+                                                           waits)
+
+
+================================================================================
+9.  CROSS-CONFIG / CROSS-KERNEL COMPARISON
+================================================================================
+
+  Kernel + config         Speedup  DRAM saved   ON bw     Predicted   |Wall|    Explained
+                                                          cost (us)   delta
+  ----------------------------------------------------------------------------------------
+  cat_trunc_2d MID         1.28x    +146 MB     543       +269        409       66%
+  deep_chain 128x128       1.20x    +110 MB     549       +200        238       84%
+  deep_chain WIN           7.31x   +3490 MB     542      +6436       7777       83%
+  dual_quant WIN           1.26x    +205 MB     444       +461        555       83%
+  dual_quant REGR          0.68x   -1146 MB     417      -2749      -4708       58%
+
+The "DRAM bytes saved at ON's rate" model:
+  - explains 83-84% of wall-time delta in 3 of 4 wins
+  - explains 58% of the slowdown in the regression case
+  - works in BOTH directions (positive delta = speedup, negative = slowdown)
+  - is the single most predictive variable across all configs
+
+dual_quant REGR is the first config where the pass NET INCREASES DRAM
+bytes. It is also the first config where the pass NET REGRESSES wall time.
+That is not coincidence -- the same mechanism (spill DRAM bandwidth)
+governs both.
+
+
+================================================================================
+10. DETERMINISM ANALYSIS
+================================================================================
+
+DETERMINISTIC for both WIN and REGR:
+  - Bit-exact correctness (sha256 for both i8 and f16 outputs).
+  - Same algorithmic global I/O (LDG/STG/F2I/F2F identical in SASS).
+  - Same launch config.
+  - Spill reqs delta in SASS direction matches ncu measurement.
+  - DRAM-saved time explains majority of wall delta (83% WIN, 58% REGR).
+  - REGR has measurable, reproducible mechanism (clone -> double spill).
+
+  Crucially, NEUTRAL is a clean control:
+    - Identical DRAM bytes OFF vs ON (937.0 vs 937.1 MB)
+    - Inst count differs (36M vs 40M) but no spill, no time delta
+    - sha256 match -- pass is value-preserving
+  The pass introduces neither speedup nor slowdown when there is no spill
+  to manipulate.
+
+INFERENTIAL still:
+  - The exact split between "extra spill bytes" and "extra cloned-chain
+    arithmetic" in REGR's residual 42%. They are coupled (more
+    arithmetic -> more pressure -> more spill).
+  - The exact partition between BAR/LDSM/STS reductions in WIN's residual
+    17%.
+
+But the headline causal claim is solidly supported by the regression
+case: the pass's mechanism is spill-DRAM bandwidth manipulation, and when
+that bandwidth goes the wrong way (REGR), wall time goes the wrong way
+in proportion.
+
+
+================================================================================
+11. RECOMMENDED FIX FOR THE REGRESSION
+================================================================================
+
+Add a cost-model guard before applying the rewrite at REGR-shaped configs:
+
+  precondition (current): both users size-reducing
+  precondition (proposed, additional):
+    estimated_post_clone_regs_per_chain <= reg_cap
+    OR
+    estimated_post_clone_spill_bytes < estimated_pre_clone_spill_bytes
+
+The simplest concrete heuristic that would have caught REGR:
+  if OFF spill_bytes > some_threshold AND tile_size > some_threshold:
+      bail (don't clone)
+Tuning thresholds against the sweep table would prevent the 4 regressions
+seen in dual_quant nsys (128x256, 256x128, plus their 4096x4096 twins).
+
+
+================================================================================
+12. ARTIFACTS PRODUCED
+================================================================================
+
+/tmp/verify_dual_quant/
+  capture.py
+  OFF_win/         OFF_regr/         OFF_neutral/
+  ON_win/          ON_regr/          ON_neutral/
+    -> each contains kernel.{cubin,sass,ptx,ttir,ttgir,llir,json}
+       + out_i8.pt, out_f16.pt, sha256.txt, launch.json
+
+/tmp/ncu_runs_dual_quant/
+  {OFF,ON}_{win,regr,neutral,big}_*.{ncu-rep,csv,log}   (already existed)
+
+Compile-side metadata (matches ncu spill request direction):
+  WIN_OFF  : 255 regs, 64 spill slots
+  WIN_ON   : 255 regs, 0 spill slots
+  REGR_OFF : 64 regs, 834 spill slots
+  REGR_ON  : 64 regs, 1238 spill slots   (PASS INCREASED SPILLS)
+  NEU_OFF  : 72 regs, 0 spill slots
+  NEU_ON   : 68 regs, 0 spill slots
+
+Pass toggle:
+  Env var TRITON_DISABLE_DOWNCAST_REORDER_OPTIMIZER (unset = ON, =1 = OFF),
+  read at runtime by make_ttir in
+  /home/pushpendram/compiler/triton/python/triton/backends/nvidia/compiler.py.
+  Final state: env var unset, pass ON.

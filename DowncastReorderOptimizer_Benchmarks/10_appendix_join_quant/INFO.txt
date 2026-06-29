@@ -1,0 +1,4 @@
+Pattern : 10_appendix_join_quant
+Report  : Section A.2 -- join + quant
+Source  : triton_kernels/join_quant_2d/
+Files   : 12

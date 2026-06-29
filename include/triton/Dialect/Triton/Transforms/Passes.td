@@ -80,3 +80,8 @@ def TritonLoopAwareCSE : Pass<"triton-loop-aware-cse", "mlir::ModuleOp"> {
 }
 
 #endif
+
+def DowncastReorderOptimizer : Pass<"downcast-reorder-optimizer", "mlir::ModuleOp"> {
+    let summary = "Hoist element size-reducing casts upstream of data-movement ops.";
+    let constructor = "mlir::triton::createDowncastReorderOptimizer()";
+}
